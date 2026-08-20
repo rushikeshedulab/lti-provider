@@ -8,6 +8,7 @@ Runs on <http://localhost:4000>.
 
 ## Table of contents
 
+0. [**Quick start — running this project**](#0-quick-start--running-this-project)
 1. [Architecture](#1-architecture)
 2. [The LTI 1.3 flow](#2-the-lti-13-flow)
 3. [Provider setup](#3-provider-setup)
@@ -21,6 +22,210 @@ Runs on <http://localhost:4000>.
 11. [How activity logging works](#11-how-activity-logging-works)
 12. [Viewing session tracking and its limits](#viewing-session-tracking-and-its-limits)
 13. [Security notes](#security-notes)
+
+---
+
+## 0. Quick start — running this project
+
+Follow these steps in order and you end up with a working LTI 1.3 demo: Postgres on `:5433`, this tool on `:4000`, the consumer LMS on `:4001`.
+
+> This app is only half the system. Content here is reachable **only** through a validated LTI launch, so there is nothing to click until the consumer LMS is running too. Start this side first — the consumer's first launch fetches this tool's JWKS.
+
+### Step 0 — Prerequisites
+
+| Requirement | Version | Verify with |
+|---|---|---|
+| Node.js | **≥ 20.19** (see `engines`) | `node -v` |
+| npm | ≥ 10 | `npm -v` |
+| Docker Desktop | any recent | `docker --version` |
+| Free TCP ports | `4000` (this app), `4001` (consumer), `5433` (Postgres) | `netstat -ano \| findstr "4000 4001 5433"` |
+
+Already running your own PostgreSQL 16? Skip Docker, create the databases yourself (see Step 1) and point `DATABASE_URL` at them.
+
+On Windows, run everything in **PowerShell** or **Git Bash**. In `cmd.exe`, replace `cp` with `copy`.
+
+### Step 1 — Start PostgreSQL (from the repository root, once)
+
+```bash
+cd ..                    # repository root, the folder holding docker-compose.yml
+docker compose up -d
+docker compose ps        # wait until the STATUS column reads "healthy"
+```
+
+One Postgres 16 container listens on **`localhost:5433`**. On first start `infra/init-databases.sql` creates the two independent databases this demo uses — the two applications never share a table:
+
+| Database | Owned by |
+|---|---|
+| `lti_provider` | this tool |
+| `lti_consumer` | the consumer LMS |
+
+Without Docker, create them manually and keep the credentials in `DATABASE_URL` in sync:
+
+```sql
+CREATE USER lti WITH PASSWORD 'lti';
+CREATE DATABASE lti_provider OWNER lti;
+CREATE DATABASE lti_consumer OWNER lti;
+```
+
+### Step 2 — Configure this application
+
+```bash
+cd lti-content-provider
+cp .env.example .env
+```
+
+The defaults work as-is for a local run. These values **must line up with the consumer's `.env`**, or every launch is rejected with `unknown_platform`:
+
+| Variable here | Default | Must match the consumer's |
+|---|---|---|
+| `CONSUMER_BASE_URL` / platform issuer | `http://localhost:4001` | `LTI_ISSUER` |
+| `LTI_CLIENT_ID` | `edulab-content-provider` | `LTI_CLIENT_ID` |
+| `LTI_DEPLOYMENT_IDS` | `deployment-fin-001` | `LTI_DEPLOYMENT_ID` |
+| `ALLOWED_FRAME_ANCESTORS` | `http://localhost:4001,http://localhost:5174` | must contain the consumer's origin, or the iframe is blocked |
+
+Change `CONTENT_SESSION_SECRET` and `ADMIN_PASSWORD` before running this anywhere other than your own machine. Full table: [§5 Environment variables](#5-environment-variables).
+
+### Step 3 — Install dependencies
+
+```bash
+npm install                  # backend: Express, pg, jose, tsx
+npm run frontend:install     # React app under frontend/
+```
+
+### Step 4 — Generate keys, create the schema, seed the content
+
+```bash
+npm run setup
+```
+
+One command, three steps, safe to re-run:
+
+| Sub-step | What it does |
+|---|---|
+| `npm run keys:generate` | Writes an RSA-2048 keypair to `keys/`. **Skips if one already exists** — pass `-- --force` to replace it |
+| `npm run db:migrate` | Applies `db/schema.sql` to `lti_provider` |
+| `npm run db:seed` | Upserts the platform registration plus the course: 4 modules, 9 items (6 videos, 2 PDFs, 1 audio) |
+
+Failing with `ECONNREFUSED … 5433` means Postgres from Step 1 is not ready — re-check `docker compose ps`.
+
+### Step 5 — Build the React frontend
+
+```bash
+npm run frontend:build       # Vite → public/, served by Express
+```
+
+Required, not optional: the backend serves the **already built** player, deep-linking picker and admin dashboard from `public/`. Skipping this leaves you on a blank page.
+
+### Step 6 — Start the server
+
+```bash
+npm run dev                  # tsx watch, restarts on backend changes
+```
+
+Expect a line like:
+
+```
+listening on            http://localhost:4000
+```
+
+Production-style instead — compiles TypeScript to `dist/`, builds the frontend, runs plain Node:
+
+```bash
+npm run build && npm start
+```
+
+Health checks:
+
+```bash
+curl http://localhost:4000/health           # {"ok":true,"service":"lti-content-provider"}
+curl http://localhost:4000/.well-known/jwks.json
+curl http://localhost:4000/lti/config       # everything a platform admin needs to register this tool
+```
+
+### Step 7 — Bring up the consumer LMS
+
+Separate application, its own README. In a **new terminal**, from the repository root:
+
+```bash
+cd lti-consumer-lms
+cp .env.example .env
+npm install
+npm run frontend:install
+npm run setup            # keys:generate + db:migrate + db:seed
+npm run frontend:build
+npm run dev              # http://localhost:4001
+```
+
+Full detail: [`../lti-consumer-lms/README.md`](../lti-consumer-lms/README.md).
+
+### Step 8 — Verify the deployment
+
+Automated, from the repository root, with **both** servers running:
+
+```bash
+node scripts/verify-lti-flow.mjs
+```
+
+114 assertions covering the whole flow end to end, security negatives included.
+
+Or by hand:
+
+1. Open <http://localhost:4001> (the **consumer**, not this app) and sign in as `angad@example.com` / `demo1234`.
+2. **My courses → Introduction to Financial Markets → Launch lecture** — this tool's player renders inside the consumer's iframe.
+3. Open <http://localhost:4000/admin>, password `admin123` (`ADMIN_PASSWORD`), and confirm the `CONTENT_LAUNCHED` / `CONTENT_VIEW_STARTED` events are there.
+
+Opening <http://localhost:4000> directly is *supposed* to be a dead end: there is no student-facing catalogue, and `/lti/launch` answers `405` without a signed `id_token`.
+
+### Copy-paste: the whole thing
+
+```bash
+# terminal 1 — database + this tool
+docker compose up -d
+cd lti-content-provider && cp .env.example .env
+npm install && npm run frontend:install && npm run setup && npm run frontend:build
+npm run dev
+
+# terminal 2 — the consumer LMS
+cd lti-consumer-lms && cp .env.example .env
+npm install && npm run frontend:install && npm run setup && npm run frontend:build
+npm run dev
+```
+
+### Optional — frontend hot reload
+
+```bash
+npm run frontend:dev         # Vite on :5173, proxying /api, /lti, /.well-known to :4000
+```
+
+Useful while editing React, but **drive the demo from :4000** — that is the origin registered with the platform.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `ECONNREFUSED … 5433` during `npm run setup` | Postgres not running or still starting — `docker compose up -d`, then `docker compose ps` |
+| `database "lti_provider" does not exist` | The container volume predates `infra/init-databases.sql` — `docker compose down -v && docker compose up -d`, then re-run `npm run setup` |
+| Blank page at `:4000/admin` | `npm run frontend:build` was skipped, so `public/` is empty |
+| `EADDRINUSE :4000` | Another process holds the port — free it, or change `PORT` **and** `PROVIDER_BASE_URL` together, plus the tool URLs in the consumer's `.env` |
+| `401 invalid_signature` on launch | This tool cannot reach `http://localhost:4001/.well-known/jwks.json` — the consumer is down, or its keys were regenerated |
+| `401 unknown_platform` on launch | Issuer / `LTI_CLIENT_ID` / deployment id differ between the two `.env` files |
+| `401 invalid_state` on a retried launch | Expected — `state` is single-use. Start a fresh launch from the consumer |
+| Player loads but the iframe is empty in the LMS | The consumer's origin is missing from `ALLOWED_FRAME_ANCESTORS` (CSP `frame-ancestors`) |
+| Video or PDF returns `401` | The media token expired — relaunch. `/media/*` is never public |
+| `Cannot find module 'tsx'` | `npm install` was not run in this folder |
+
+### Deploying beyond localhost
+
+The demo is wired for `http://localhost`. For a shared or hosted deployment:
+
+1. Set `PROVIDER_BASE_URL` to the public **https** origin of this tool, and `CONSUMER_BASE_URL` / the platform endpoints to the consumer's public origin — then make the mirror-image edit in the consumer's `.env`.
+2. Put the consumer's public origin in `ALLOWED_FRAME_ANCESTORS`; without it the browser refuses to embed the player.
+3. Replace `CONTENT_SESSION_SECRET` and `ADMIN_PASSWORD` with real secrets. Never commit `.env` or `keys/` — both are gitignored, and the private key must never be served.
+4. Serve over TLS. The player runs in a cross-site iframe, so the state cookie only becomes `SameSite=None; Secure` under HTTPS.
+5. Point `DATABASE_URL` at a managed Postgres and run `npm run db:migrate`. Run `npm run db:seed` only if you want the demo course.
+6. Ship the files in `media/` alongside the app (they are not in the database) or mount them from persistent storage.
+7. Run `npm run build && npm start` behind a process manager — not `npm run dev`.
+8. Confirm both sides still agree: `npm run registration:print` here and in the consumer.
 
 ---
 
