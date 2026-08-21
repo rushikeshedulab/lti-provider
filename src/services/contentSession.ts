@@ -101,3 +101,24 @@ export async function verifyDeepLinkSession(token: string): Promise<{ launchId: 
   });
   return { launchId: payload.launchId as string };
 }
+
+/**
+ * ADMIN PREVIEW TOKEN
+ * -------------------
+ * The provider's own admin catalog needs to actually play the content it is
+ * serving, and there is no launch behind that view. This mints the same kind of
+ * media capability, bound to the same single path, but marked as an operator
+ * preview and deliberately short-lived - it is handed only to a request that
+ * already carried a valid admin bearer token.
+ */
+export const ADMIN_PREVIEW_LAUNCH_ID = 'admin-preview';
+
+export async function issueAdminPreviewToken(path: string): Promise<string> {
+  return new SignJWT({ path, launchId: ADMIN_PREVIEW_LAUNCH_ID })
+    .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
+    .setIssuer(env.baseUrl)
+    .setAudience('media')
+    .setIssuedAt()
+    .setExpirationTime('30m')
+    .sign(secret);
+}

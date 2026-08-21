@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useState } from 'react';
 import { api, formatDuration, formatTime } from '../lib/api';
 
 interface ActivityRow {
@@ -74,6 +74,60 @@ interface Registrations {
   }[];
 }
 
+interface CatalogLecture {
+  id: string;
+  title: string;
+  description: string;
+  content_type: 'video' | 'audio' | 'pdf' | 'image';
+  content_url: string;
+  poster_url: string | null;
+  duration_seconds: number;
+  position: number;
+  self_hosted: boolean;
+  has_playback_timeline: boolean;
+  launches: number;
+  students: number;
+  deep_link_selections: number;
+  sessions: number;
+  watched_seconds: number;
+  presence_seconds: number;
+  last_delivered_at: string | null;
+  consumers: string[];
+}
+
+interface Catalog {
+  catalog: {
+    id: string;
+    title: string;
+    description: string;
+    modules: { id: string; title: string; position: number; lectures: CatalogLecture[] }[];
+  }[];
+  totals: {
+    courses: number;
+    modules: number;
+    lectures: number;
+    selfHosted: number;
+    runtimeSeconds: number;
+    neverDelivered: number;
+  };
+  resourceLinkTemplate: { type: string; url: string; custom: string[] };
+}
+
+interface Preview {
+  id: string;
+  title: string;
+  description: string;
+  contentType: 'video' | 'audio' | 'pdf' | 'image';
+  contentUrl: string;
+  storedUrl: string;
+  posterUrl: string | null;
+  durationSeconds: number;
+  selfHosted: boolean;
+  hasPlaybackTimeline: boolean;
+  moduleTitle: string;
+  courseTitle: string;
+}
+
 const TOKEN_KEY = 'provider-admin-token';
 const EVENTS = [
   'CONTENT_LAUNCHED',
@@ -92,16 +146,90 @@ function eventBadge(event: string): string {
   return 'badge accent';
 }
 
+/** video/audio carry a real timeline; pdf/image can only report presence. */
+function typeBadge(contentType: string): string {
+  if (contentType === 'video') return 'badge accent';
+  if (contentType === 'audio') return 'badge good';
+  if (contentType === 'pdf') return 'badge warn';
+  return 'badge';
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Renders the actual file, the same way the launched player renders it - but
+ * without any telemetry attached, because this is the operator looking at their
+ * own library rather than a student consuming a lecture.
+ */
+function ContentViewer({ item }: { item: Preview }) {
+  return (
+    <div style={{ padding: '6px 2px 10px', maxWidth: 760 }}>
+      <div className="row" style={{ gap: 8, marginBottom: 10 }}>
+        <span className={typeBadge(item.contentType)}>{item.contentType}</span>
+        <span className="badge">{formatDuration(item.durationSeconds)}</span>
+        {item.selfHosted ? (
+          <span className="badge good">self-hosted · signed URL</span>
+        ) : (
+          <span className="badge">external · {hostOf(item.contentUrl)}</span>
+        )}
+        <span className="muted small">
+          {item.courseTitle} · {item.moduleTitle}
+        </span>
+      </div>
+
+      {item.contentType === 'video' && (
+        <video controls preload="metadata" poster={item.posterUrl ?? undefined}>
+          <source src={item.contentUrl} type="video/mp4" />
+          Your browser cannot play this video.
+        </video>
+      )}
+
+      {item.contentType === 'audio' && <audio controls preload="metadata" src={item.contentUrl} style={{ width: '100%' }} />}
+
+      {item.contentType === 'pdf' && (
+        <div className="doc-frame">
+          <iframe src={item.contentUrl} title={item.title} />
+        </div>
+      )}
+
+      {item.contentType === 'image' && (
+        <img src={item.contentUrl} alt={item.title} style={{ width: '100%', borderRadius: 8, display: 'block' }} />
+      )}
+
+      <p className="muted small" style={{ margin: '10px 0 6px' }}>{item.description}</p>
+      <div className="row small" style={{ gap: 8 }}>
+        <span className="muted mono">{item.storedUrl}</span>
+        <a href={item.contentUrl} target="_blank" rel="noreferrer">
+          Open in a new tab
+        </a>
+      </div>
+      <p className="muted small" style={{ marginBottom: 0 }}>
+        Previewing here is not logged and opens no viewing session - the delivery numbers stay student-only.
+      </p>
+    </div>
+  );
+}
+
 export default function Admin() {
   const [token, setToken] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY));
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
 
-  const [tab, setTab] = useState<'activity' | 'sessions' | 'students' | 'registration'>('activity');
+  const [tab, setTab] = useState<'activity' | 'sessions' | 'students' | 'catalog' | 'registration'>('activity');
   const [activity, setActivity] = useState<ActivityRow[]>([]);
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [registrations, setRegistrations] = useState<Registrations | null>(null);
+  const [catalog, setCatalog] = useState<Catalog | null>(null);
+  const [preview, setPreview] = useState<Preview | null>(null);
+  const [previewError, setPreviewError] = useState<{ id: string; message: string } | null>(null);
+  const [previewLoading, setPreviewLoading] = useState<string | null>(null);
   const [eventFilter, setEventFilter] = useState('');
   const [emailFilter, setEmailFilter] = useState('');
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -145,10 +273,38 @@ export default function Admin() {
   }, [autoRefresh, load, token]);
 
   useEffect(() => {
+    if (tab === 'catalog' && token) {
+      authed<Catalog>('/api/admin/catalog').then(setCatalog).catch(() => undefined);
+    }
+  }, [tab, token, authed]);
+
+  useEffect(() => {
     if (tab === 'registration' && token && !registrations) {
       authed<Registrations>('/api/admin/registrations').then(setRegistrations).catch(() => undefined);
     }
   }, [tab, token, registrations, authed]);
+
+  /**
+   * Opens the real file inline. The provider signs a fresh, short-lived media
+   * URL for self-hosted content; external items are played from their own host.
+   * Nothing here is logged - an operator looking at the library is not a view.
+   */
+  const openPreview = async (lectureId: string) => {
+    if (preview?.id === lectureId) {
+      setPreview(null);
+      return;
+    }
+    setPreviewError(null);
+    setPreviewLoading(lectureId);
+    try {
+      setPreview(await authed<Preview>(`/api/admin/preview/${encodeURIComponent(lectureId)}`));
+    } catch (err) {
+      setPreview(null);
+      setPreviewError({ id: lectureId, message: (err as Error).message });
+    } finally {
+      setPreviewLoading(null);
+    }
+  };
 
   const login = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -255,11 +411,12 @@ export default function Admin() {
       )}
 
       <div className="row" style={{ marginBottom: 14 }}>
-        {(['activity', 'sessions', 'students', 'registration'] as const).map((t) => (
+        {(['activity', 'sessions', 'students', 'catalog', 'registration'] as const).map((t) => (
           <button key={t} className={tab === t ? 'small' : 'secondary small'} onClick={() => setTab(t)}>
             {t === 'activity' && 'Activity log'}
             {t === 'sessions' && 'Viewing sessions'}
             {t === 'students' && 'Per student / lecture'}
+            {t === 'catalog' && 'Content catalog'}
             {t === 'registration' && 'LTI registration'}
           </button>
         ))}
@@ -497,6 +654,209 @@ export default function Admin() {
             </div>
           </div>
         </div>
+      )}
+
+      {tab === 'catalog' && (
+        <>
+          <div className="notice" style={{ marginBottom: 16 }}>
+            This is everything the provider can serve. A consumer never receives these rows - it stores a resource
+            link per lecture and asks for the content again on every launch, which is why each item below carries its
+            own delivery record.
+          </div>
+
+          {!catalog && <div className="card empty">Loading catalog…</div>}
+
+          {catalog && (
+            <>
+              <div className="grid stats" style={{ marginBottom: 16 }}>
+                <div className="stat">
+                  <div className="label">Courses</div>
+                  <div className="value">{catalog.totals.courses}</div>
+                </div>
+                <div className="stat">
+                  <div className="label">Modules</div>
+                  <div className="value">{catalog.totals.modules}</div>
+                </div>
+                <div className="stat">
+                  <div className="label">Lectures</div>
+                  <div className="value">{catalog.totals.lectures}</div>
+                </div>
+                <div className="stat">
+                  <div className="label">Self-hosted</div>
+                  <div className="value">{catalog.totals.selfHosted}</div>
+                </div>
+                <div className="stat">
+                  <div className="label">Total runtime</div>
+                  <div className="value">{formatDuration(catalog.totals.runtimeSeconds)}</div>
+                </div>
+                <div className="stat">
+                  <div className="label">Never delivered</div>
+                  <div className="value">{catalog.totals.neverDelivered}</div>
+                </div>
+              </div>
+
+              {catalog.catalog.map((course) => (
+                <div className="card" key={course.id}>
+                  <div className="row" style={{ marginBottom: 4 }}>
+                    <h2 style={{ margin: 0 }}>{course.title}</h2>
+                    <span className="badge mono">{course.id}</span>
+                  </div>
+                  <p className="muted small">{course.description}</p>
+
+                  {course.modules.map((module) => (
+                    <div key={module.id} style={{ marginTop: 16 }}>
+                      <div className="row" style={{ marginBottom: 6 }}>
+                        <h3 style={{ margin: 0 }}>{module.title}</h3>
+                        <span className="muted small mono">{module.id}</span>
+                      </div>
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Lecture</th>
+                              <th>Type</th>
+                              <th>Runtime</th>
+                              <th>Source</th>
+                              <th>Picked</th>
+                              <th>Launches</th>
+                              <th>Watched</th>
+                              <th>Last delivered</th>
+                              <th>Consumers</th>
+                              <th>View</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {module.lectures.length === 0 && (
+                              <tr>
+                                <td colSpan={10} className="empty">
+                                  No lectures in this module.
+                                </td>
+                              </tr>
+                            )}
+                            {module.lectures.map((lecture) => (
+                              <Fragment key={lecture.id}>
+                                <tr>
+                                  <td>
+                                    {lecture.title}
+                                    <br />
+                                    <span className="muted small">{lecture.description}</span>
+                                    <br />
+                                    <span className="muted mono small">lecture_id={lecture.id}</span>
+                                  </td>
+                                  <td>
+                                    <span className={typeBadge(lecture.content_type)}>{lecture.content_type}</span>
+                                    {!lecture.has_playback_timeline && (
+                                      <>
+                                        <br />
+                                        <span className="muted small">presence only</span>
+                                      </>
+                                    )}
+                                  </td>
+                                  <td className="small">{formatDuration(lecture.duration_seconds)}</td>
+                                  <td className="small">
+                                    {lecture.self_hosted ? (
+                                      <>
+                                        <span className="badge good">self-hosted</span>
+                                        <br />
+                                        <span className="muted mono small">{lecture.content_url}</span>
+                                        <br />
+                                        <span className="muted small">served behind a signed per-launch URL</span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <span className="badge">external</span>
+                                        <br />
+                                        <span className="muted mono small">{hostOf(lecture.content_url)}</span>
+                                      </>
+                                    )}
+                                  </td>
+                                  <td>
+                                    {lecture.deep_link_selections}
+                                    <br />
+                                    <span className="muted small">deep links</span>
+                                  </td>
+                                  <td>
+                                    {lecture.launches}
+                                    <br />
+                                    <span className="muted small">{lecture.students} students</span>
+                                  </td>
+                                  <td className="small">
+                                    {lecture.sessions === 0 ? (
+                                      <span className="muted">-</span>
+                                    ) : (
+                                      <>
+                                        {formatDuration(lecture.watched_seconds)}
+                                        <br />
+                                        <span className="muted">{lecture.sessions} sessions</span>
+                                      </>
+                                    )}
+                                  </td>
+                                  <td className="small">
+                                    {lecture.last_delivered_at ? (
+                                      formatTime(lecture.last_delivered_at)
+                                    ) : (
+                                      <span className="badge warn">never</span>
+                                    )}
+                                  </td>
+                                  <td className="small">
+                                    {lecture.consumers.length === 0 ? (
+                                      <span className="muted">-</span>
+                                    ) : (
+                                      lecture.consumers.join(', ')
+                                    )}
+                                  </td>
+                                  <td>
+                                    <button
+                                      className={preview?.id === lecture.id ? 'small' : 'secondary small'}
+                                      disabled={previewLoading === lecture.id}
+                                      onClick={() => void openPreview(lecture.id)}
+                                    >
+                                      {previewLoading === lecture.id
+                                        ? 'Opening…'
+                                        : preview?.id === lecture.id
+                                          ? 'Close'
+                                          : 'View'}
+                                    </button>
+                                  </td>
+                                </tr>
+                                {preview?.id === lecture.id && (
+                                  <tr>
+                                    <td colSpan={10} style={{ background: 'var(--surface-2)' }}>
+                                      <ContentViewer item={preview} />
+                                    </td>
+                                  </tr>
+                                )}
+                                {previewError?.id === lecture.id && (
+                                  <tr>
+                                    <td colSpan={10}>
+                                      <div className="notice bad">{previewError.message}</div>
+                                    </td>
+                                  </tr>
+                                )}
+                              </Fragment>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ))}
+
+              <div className="card">
+                <h2>What the consumer actually receives</h2>
+                <p className="muted small">
+                  On Deep Linking the provider returns one signed <span className="mono">ltiResourceLink</span> per
+                  selected lecture. The consumer keeps the title and these custom parameters; the content URLs above
+                  never leave this side.
+                </p>
+                <pre className="mono small" style={{ whiteSpace: 'pre-wrap' }}>
+                  {JSON.stringify(catalog.resourceLinkTemplate, null, 2)}
+                </pre>
+              </div>
+            </>
+          )}
+        </>
       )}
 
       {tab === 'registration' && (
