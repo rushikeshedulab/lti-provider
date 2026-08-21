@@ -6,6 +6,7 @@ import { env, toolEndpoints } from './config/env.js';
 import { toolRegistrationDocument } from './config/registration.js';
 import { getPublicJwks } from './lti/keys.js';
 import { verifyMediaToken } from './services/contentSession.js';
+import { MEDIA_DIR } from './content/uploads.js';
 import { renderErrorPage } from './utils/http.js';
 import { purgeExpired } from './lti/stateStore.js';
 import { ltiRouter } from './routes/lti.routes.js';
@@ -51,8 +52,6 @@ app.get('/health', (_req, res) => res.json({ ok: true, service: 'lti-content-pro
  * Range requests, which is what lets a video seek and a PDF viewer fetch one
  * page at a time instead of downloading the whole file first.
  */
-const mediaDir = resolve(process.cwd(), 'media');
-
 app.get('/media/:filename', async (req, res) => {
   // basename() strips any path traversal attempt before it reaches the disk.
   const filename = basename(String(req.params.filename));
@@ -84,7 +83,7 @@ app.get('/media/:filename', async (req, res) => {
     );
   }
 
-  const filePath = join(mediaDir, filename);
+  const filePath = join(MEDIA_DIR, filename);
   if (!existsSync(filePath)) {
     return renderErrorPage(res, 404, 'File not found', `No such file: ${filename}`, 'file_missing');
   }

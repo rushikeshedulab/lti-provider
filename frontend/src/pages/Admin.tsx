@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, formatDuration, formatTime } from '../lib/api';
+import ContentManager from './ContentManager';
 
 interface ActivityRow {
   id: string;
@@ -97,7 +98,7 @@ export default function Admin() {
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
 
-  const [tab, setTab] = useState<'activity' | 'sessions' | 'students' | 'registration'>('activity');
+  const [tab, setTab] = useState<'activity' | 'sessions' | 'students' | 'content' | 'registration'>('activity');
   const [activity, setActivity] = useState<ActivityRow[]>([]);
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
@@ -255,15 +256,18 @@ export default function Admin() {
       )}
 
       <div className="row" style={{ marginBottom: 14 }}>
-        {(['activity', 'sessions', 'students', 'registration'] as const).map((t) => (
+        {(['activity', 'sessions', 'students', 'content', 'registration'] as const).map((t) => (
           <button key={t} className={tab === t ? 'small' : 'secondary small'} onClick={() => setTab(t)}>
             {t === 'activity' && 'Activity log'}
             {t === 'sessions' && 'Viewing sessions'}
             {t === 'students' && 'Per student / lecture'}
+            {t === 'content' && 'Content library'}
             {t === 'registration' && 'LTI registration'}
           </button>
         ))}
       </div>
+
+      {tab === 'content' && <ContentManager token={token} />}
 
       {tab === 'activity' && (
         <div className="card">

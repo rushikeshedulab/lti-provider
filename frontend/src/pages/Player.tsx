@@ -8,6 +8,8 @@ interface Lecture {
   title: string;
   description: string;
   contentType: ContentType;
+  /** Derived from the file extension by the provider; null for external URLs. */
+  mimeType: string | null;
   contentUrl: string;
   selfHosted: boolean;
   /** video/audio expose a timeline; pdf/image do not. */
@@ -229,14 +231,15 @@ export default function Player() {
             poster={lecture.posterUrl ?? undefined}
             {...mediaProps}
           >
-            <source src={lecture.contentUrl} type="video/mp4" />
+            {/* Whatever was uploaded - mp4, webm, mov - not just mp4. */}
+            <source src={lecture.contentUrl} type={lecture.mimeType ?? undefined} />
             Your browser cannot play this video.
           </video>
         )}
 
         {lecture.contentType === 'audio' && (
           <audio ref={mediaRef as React.RefObject<HTMLAudioElement>} style={{ width: '100%' }} {...mediaProps}>
-            <source src={lecture.contentUrl} />
+            <source src={lecture.contentUrl} type={lecture.mimeType ?? undefined} />
             Your browser cannot play this audio.
           </audio>
         )}

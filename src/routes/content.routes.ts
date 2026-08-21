@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { CLAIM, getCustom, type ContextClaim, type ResourceLinkClaim } from '../lti/claims.js';
 import { getLecture, hasPlaybackTimeline, isSelfHosted, toDeliverableUrl } from '../content/repository.js';
+import { mimeTypeForPath } from '../content/uploads.js';
 import { consumeLaunchToken } from '../services/launchStore.js';
 import { issueContentSession, issueMediaToken } from '../services/contentSession.js';
 import { query } from '../db/pool.js';
@@ -74,6 +75,9 @@ contentRouter.post('/launch/exchange', async (req, res) => {
       description: lecture.description,
       contentType: lecture.content_type,
       contentUrl: toDeliverableUrl(lecture.content_url, mediaToken),
+      // Derived from the extension so the player can label <source type="...">
+      // correctly for whatever was uploaded, not just for mp4.
+      mimeType: mimeTypeForPath(lecture.content_url),
       selfHosted: isSelfHosted(lecture.content_url),
       hasPlaybackTimeline: hasPlaybackTimeline(lecture.content_type),
       posterUrl: lecture.poster_url,

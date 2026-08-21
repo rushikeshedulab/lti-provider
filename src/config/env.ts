@@ -31,6 +31,9 @@ export const env = {
 
   adminPassword: required('ADMIN_PASSWORD', 'admin123'),
 
+  /** Ceiling for a single uploaded file, enforced while streaming to ./media. */
+  maxUploadMb: num('MAX_UPLOAD_MB', 512),
+
   allowedFrameAncestors: (process.env.ALLOWED_FRAME_ANCESTORS ?? 'http://localhost:4001,http://localhost:5174')
     .split(',')
     .map((s) => s.trim())
