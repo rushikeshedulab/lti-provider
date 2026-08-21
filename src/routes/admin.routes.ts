@@ -5,6 +5,14 @@ import { query } from '../db/pool.js';
 import { listPlatforms } from '../lti/platformStore.js';
 import { toolRegistrationDocument } from '../config/registration.js';
 import { getLaunch } from '../services/launchStore.js';
+import {
+  getCatalogWithDelivery,
+  getLecture,
+  hasPlaybackTimeline,
+  isSelfHosted,
+  toDeliverableUrl,
+} from '../content/repository.js';
+import { issueAdminPreviewToken } from '../services/contentSession.js';
 
 export const adminRouter = Router();
 
@@ -143,6 +151,77 @@ adminRouter.get('/summary', async (_req, res) => {
   );
 
   res.json({ totals, perStudent, perLecture });
+});
+
+/**
+ * THE CATALOG THIS PROVIDER SERVES
+ * --------------------------------
+ * Everything the provider is able to hand to a consumer, with the delivery
+ * record for each item. Deliberately admin-only: the provider still has no
+ * public course list, because a student must arrive through a validated LTI
+ * launch. `content_url` is the stored location, not a playable link - the bytes
+ * of self-hosted files are only reachable through a signed, per-launch URL.
+ */
+adminRouter.get('/catalog', async (_req, res) => {
+  const catalog = await getCatalogWithDelivery();
+  const lectures = catalog.flatMap((c) => c.modules.flatMap((m) => m.lectures));
+
+  res.json({
+    catalog,
+    totals: {
+      courses: catalog.length,
+      modules: catalog.reduce((n, c) => n + c.modules.length, 0),
+      lectures: lectures.length,
+      selfHosted: lectures.filter((l) => l.self_hosted).length,
+      runtimeSeconds: lectures.reduce((n, l) => n + l.duration_seconds, 0),
+      neverDelivered: lectures.filter((l) => l.launches === 0).length,
+    },
+    // What a consumer actually stores per selected lecture - the provider hands
+    // over a resource link and these custom parameters, nothing else.
+    resourceLinkTemplate: {
+      type: 'ltiResourceLink',
+      url: toolEndpoints.targetLinkUri,
+      custom: ['lecture_id', 'content_type', 'module_id', 'module_title', 'course_id', 'course_title'],
+    },
+  });
+});
+
+/**
+ * PREVIEW ONE ITEM FROM THE CATALOG
+ * ---------------------------------
+ * Plays the real file the consumer's students would get, from this side. For
+ * self-hosted content that means minting a short-lived media capability, since
+ * /media never serves unsigned requests - the same rule that applies to a
+ * launched player applies to the operator looking at their own library.
+ *
+ * This is an operator preview, not a delivery: nothing is written to the
+ * activity log and no viewing session is opened, so previewing here cannot
+ * pollute the numbers reported for real student viewing.
+ */
+adminRouter.get('/preview/:lectureId', async (req, res) => {
+  const lecture = await getLecture(String(req.params.lectureId));
+  if (!lecture) {
+    res.status(404).json({ error: 'lecture_not_found' });
+    return;
+  }
+
+  const selfHosted = isSelfHosted(lecture.content_url);
+  const mediaToken = selfHosted ? await issueAdminPreviewToken(lecture.content_url) : undefined;
+
+  res.json({
+    id: lecture.id,
+    title: lecture.title,
+    description: lecture.description,
+    contentType: lecture.content_type,
+    contentUrl: toDeliverableUrl(lecture.content_url, mediaToken),
+    storedUrl: lecture.content_url,
+    posterUrl: lecture.poster_url,
+    durationSeconds: lecture.duration_seconds,
+    selfHosted,
+    hasPlaybackTimeline: hasPlaybackTimeline(lecture.content_type),
+    moduleTitle: lecture.module_title,
+    courseTitle: lecture.course_title,
+  });
 });
 
 /** The full decoded id_token of one launch - useful when demonstrating the flow. */
