@@ -153,6 +153,34 @@ CREATE TABLE IF NOT EXISTS lti_launches (
 CREATE INDEX IF NOT EXISTS lti_launches_user_idx ON lti_launches(user_id);
 CREATE INDEX IF NOT EXISTS lti_launches_time_idx ON lti_launches(launched_at DESC);
 
+-- The admin can retire content at any time, but a launch record is history and
+-- must survive it. Point the content references at ON DELETE SET NULL, keeping
+-- the row (and its id_token claims, which name the content anyway).
+DO $$
+DECLARE
+  target RECORD;
+BEGIN
+  FOR target IN
+    SELECT * FROM (VALUES
+      ('lti_launches_course_id_fkey',  'course_id',  'courses'),
+      ('lti_launches_module_id_fkey',  'module_id',  'modules'),
+      ('lti_launches_lecture_id_fkey', 'lecture_id', 'lectures')
+    ) AS t(conname, column_name, referenced_table)
+  LOOP
+    IF EXISTS (
+      SELECT 1 FROM pg_constraint c
+       WHERE c.conname = target.conname AND c.confdeltype <> 'n'
+    ) THEN
+      EXECUTE format('ALTER TABLE lti_launches DROP CONSTRAINT %I', target.conname);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = target.conname) THEN
+      EXECUTE format(
+        'ALTER TABLE lti_launches ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE SET NULL',
+        target.conname, target.column_name, target.referenced_table);
+    END IF;
+  END LOOP;
+END $$;
+
 -- Short-lived opaque handle that carries the validated launch from the HTTP
 -- redirect into the React player without using a third-party cookie.
 CREATE TABLE IF NOT EXISTS launch_tokens (

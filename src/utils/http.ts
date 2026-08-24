@@ -32,7 +32,7 @@ export function renderErrorPage(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHtml(title)}</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root { color-scheme: light; }
   body { margin:0; min-height:100vh; display:grid; place-items:center;
          font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
          background:#f6f7f9; color:#1a1d23; padding:24px; }
@@ -44,12 +44,6 @@ export function renderErrorPage(
          background:#fdecec; color:#b3261e; border:1px solid #f5c6c4;
          border-radius:6px; padding:3px 8px; margin-bottom:14px; }
   .hint { font-size:13px; color:#6b7280; border-top:1px solid #eceff2; padding-top:14px; margin-top:6px; }
-  @media (prefers-color-scheme: dark) {
-    body { background:#14161a; color:#e6e8eb; }
-    .card { background:#1c1f24; border-color:#2c3037; box-shadow:none; }
-    p { color:#a8adb6; } .hint { color:#868d97; border-top-color:#2c3037; }
-    .tag { background:#3a1d1c; color:#f2b8b5; border-color:#5c2c2a; }
-  }
 </style></head>
 <body><div class="card">
   ${code ? `<div class="tag">${escapeHtml(code)}</div>` : ''}

@@ -31,8 +31,8 @@ export const env = {
 
   adminPassword: required('ADMIN_PASSWORD', 'admin123'),
 
-  /** Ceiling for a single uploaded file, enforced while streaming to ./media. */
-  maxUploadMb: num('MAX_UPLOAD_MB', 512),
+  /** Ceiling for a single admin content upload. Videos are the reason it is high. */
+  mediaMaxUploadBytes: num('MEDIA_MAX_UPLOAD_MB', 1024) * 1024 * 1024,
 
   allowedFrameAncestors: (process.env.ALLOWED_FRAME_ANCESTORS ?? 'http://localhost:4001,http://localhost:5174')
     .split(',')

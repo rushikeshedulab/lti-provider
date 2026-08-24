@@ -14,6 +14,8 @@ import { contentRouter } from './routes/content.routes.js';
 import { activityRouter } from './routes/activity.routes.js';
 import { deepLinkRouter } from './routes/deepLink.routes.js';
 import { adminRouter } from './routes/admin.routes.js';
+import { catalogRouter } from './routes/catalog.routes.js';
+import { ensureMediaDir } from './content/manage.js';
 import { startReaper } from './services/viewingSession.js';
 
 const app = express();
@@ -111,6 +113,7 @@ app.get('/lti/config', (_req, res) => {
 // --- LTI + application routes ---------------------------------------------
 app.use('/lti', ltiRouter);
 app.use('/api', contentRouter);
+app.use('/api', catalogRouter);
 app.use('/api/activity', activityRouter);
 app.use('/api/deep-link', deepLinkRouter);
 app.use('/api/admin', adminRouter);
@@ -147,8 +150,10 @@ app.listen(env.port, () => {
   console.log(`  login initiation URL    ${toolEndpoints.loginInitiationUrl}`);
   console.log(`  redirect URI (launch)   ${toolEndpoints.redirectUri}`);
   console.log(`  JWKS                    ${toolEndpoints.jwksUrl}`);
-  console.log(`  admin dashboard         ${env.baseUrl}/admin`);
+  console.log(`  admin (content + logs)  ${env.baseUrl}/admin`);
+  console.log(`  catalog service         ${env.baseUrl}/api/catalog`);
   console.log('');
+  ensureMediaDir();
   startReaper();
   purgeExpired().catch(() => {});
   setInterval(() => void purgeExpired().catch(() => {}), 15 * 60 * 1000).unref();

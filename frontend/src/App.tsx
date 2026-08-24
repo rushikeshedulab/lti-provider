@@ -21,7 +21,7 @@ export default function App() {
               Overview
             </NavLink>
             <NavLink to="/admin" className={({ isActive }) => (isActive ? 'active' : '')}>
-              Activity Logs
+              Admin
             </NavLink>
           </nav>
         </header>

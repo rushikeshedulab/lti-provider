@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, formatDuration, formatTime } from '../lib/api';
-import ContentManager from './ContentManager';
+import AdminContent from './AdminContent';
 
 interface ActivityRow {
   id: string;
@@ -98,7 +98,7 @@ export default function Admin() {
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
 
-  const [tab, setTab] = useState<'activity' | 'sessions' | 'students' | 'content' | 'registration'>('activity');
+  const [tab, setTab] = useState<'content' | 'activity' | 'sessions' | 'students' | 'registration'>('content');
   const [activity, setActivity] = useState<ActivityRow[]>([]);
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
@@ -140,10 +140,10 @@ export default function Admin() {
   }, [load]);
 
   useEffect(() => {
-    if (!autoRefresh || !token) return;
+    if (!autoRefresh || !token || tab === 'content') return;
     const id = setInterval(() => void load(), 10_000);
     return () => clearInterval(id);
-  }, [autoRefresh, load, token]);
+  }, [autoRefresh, load, token, tab]);
 
   useEffect(() => {
     if (tab === 'registration' && token && !registrations) {
@@ -171,7 +171,9 @@ export default function Admin() {
       <div className="page narrow">
         <div className="card">
           <h1>Provider admin</h1>
-          <p className="subtitle">Activity logs for every LTI launch and viewing session.</p>
+          <p className="subtitle">
+            Upload and publish course content, and read the activity log for every LTI launch and viewing session.
+          </p>
           <form onSubmit={login}>
             <div className="field">
               <label htmlFor="pw">Admin password</label>
@@ -196,24 +198,30 @@ export default function Admin() {
     <div className="page">
       <div className="row" style={{ marginBottom: 18 }}>
         <div>
-          <h1 style={{ marginBottom: 2 }}>Content activity</h1>
+          <h1 style={{ marginBottom: 2 }}>{tab === 'content' ? 'Course content' : 'Content activity'}</h1>
           <p className="muted small" style={{ margin: 0 }}>
-            Every row here was produced by this provider - launches from LTI, durations from the player.
+            {tab === 'content'
+              ? 'What you publish here is what every consumer LMS shows - it is mirrored automatically.'
+              : 'Every row here was produced by this provider - launches from LTI, durations from the player.'}
           </p>
         </div>
         <div style={{ marginLeft: 'auto' }} className="row">
-          <label className="row small" style={{ margin: 0, gap: 6 }}>
-            <input
-              type="checkbox"
-              checked={autoRefresh}
-              onChange={(e) => setAutoRefresh(e.target.checked)}
-              style={{ width: 'auto' }}
-            />
-            auto-refresh
-          </label>
-          <button className="secondary small" onClick={() => void load()}>
-            Refresh
-          </button>
+          {tab !== 'content' && (
+            <>
+              <label className="row small" style={{ margin: 0, gap: 6 }}>
+                <input
+                  type="checkbox"
+                  checked={autoRefresh}
+                  onChange={(e) => setAutoRefresh(e.target.checked)}
+                  style={{ width: 'auto' }}
+                />
+                auto-refresh
+              </label>
+              <button className="secondary small" onClick={() => void load()}>
+                Refresh
+              </button>
+            </>
+          )}
           <button
             className="secondary small"
             onClick={() => {
@@ -226,7 +234,7 @@ export default function Admin() {
         </div>
       </div>
 
-      {summary && (
+      {summary && tab !== 'content' && (
         <div className="grid stats" style={{ marginBottom: 18 }}>
           <div className="stat">
             <div className="label">LTI launches</div>
@@ -256,8 +264,9 @@ export default function Admin() {
       )}
 
       <div className="row" style={{ marginBottom: 14 }}>
-        {(['activity', 'sessions', 'students', 'content', 'registration'] as const).map((t) => (
+        {(['content', 'activity', 'sessions', 'students', 'registration'] as const).map((t) => (
           <button key={t} className={tab === t ? 'small' : 'secondary small'} onClick={() => setTab(t)}>
+            {t === 'content' && 'Content'}
             {t === 'activity' && 'Activity log'}
             {t === 'sessions' && 'Viewing sessions'}
             {t === 'students' && 'Per student / lecture'}
@@ -267,7 +276,7 @@ export default function Admin() {
         ))}
       </div>
 
-      {tab === 'content' && <ContentManager token={token} />}
+      {tab === 'content' && <AdminContent token={token} />}
 
       {tab === 'activity' && (
         <div className="card">

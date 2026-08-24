@@ -1,6 +1,6 @@
 # LTI Content Provider — LTI 1.3 **Tool**
 
-Owns the course content and every record of who watched it. Content is reachable **only** through a validated LTI 1.3 launch; there is no student-facing catalogue and no public content API.
+Owns the course content and every record of who watched it. **All content is uploaded here, by this tool's administrator at `/admin`** — every registered consumer LMS then mirrors the catalog automatically, so an upload here is a lecture there. Content itself is reachable **only** through a validated LTI 1.3 launch; there is no student-facing catalogue and no public content API.
 
 Runs on <http://localhost:4000>.
 
@@ -21,6 +21,213 @@ Runs on <http://localhost:4000>.
 11. [How activity logging works](#11-how-activity-logging-works)
 12. [Viewing session tracking and its limits](#viewing-session-tracking-and-its-limits)
 13. [Security notes](#security-notes)
+
+---
+
+## 0. Quick start — running this project
+
+Follow these steps in order and you end up with a working LTI 1.3 demo: Postgres on `:5433`, this tool on `:4000`, the consumer LMS on `:4001`.
+
+> This app is only half the system. Content here is reachable **only** through a validated LTI launch, so there is nothing to click until the consumer LMS is running too. Start this side first — the consumer's first launch fetches this tool's JWKS.
+
+### Step 0 — Prerequisites
+
+| Requirement | Version | Verify with |
+|---|---|---|
+| Node.js | **≥ 20.19** (see `engines`) | `node -v` |
+| npm | ≥ 10 | `npm -v` |
+| Docker Desktop | any recent | `docker --version` |
+| Free TCP ports | `4000` (this app), `4001` (consumer), `5433` (Postgres) | `netstat -ano \| findstr "4000 4001 5433"` |
+
+Already running your own PostgreSQL 16? Skip Docker, create the databases yourself (see Step 1) and point `DATABASE_URL` at them.
+
+On Windows, run everything in **PowerShell** or **Git Bash**. In `cmd.exe`, replace `cp` with `copy`.
+
+### Step 1 — Start PostgreSQL (from the repository root, once)
+
+```bash
+cd ..                    # repository root, the folder holding docker-compose.yml
+docker compose up -d
+docker compose ps        # wait until the STATUS column reads "healthy"
+```
+
+One Postgres 16 container listens on **`localhost:5433`**. On first start `infra/init-databases.sql` creates the two independent databases this demo uses — the two applications never share a table:
+
+| Database | Owned by |
+|---|---|
+| `lti_provider` | this tool |
+| `lti_consumer` | the consumer LMS |
+
+Without Docker, create them manually and keep the credentials in `DATABASE_URL` in sync:
+
+```sql
+CREATE USER lti WITH PASSWORD 'lti';
+CREATE DATABASE lti_provider OWNER lti;
+CREATE DATABASE lti_consumer OWNER lti;
+```
+
+### Step 2 — Configure this application
+
+```bash
+cd lti-content-provider
+cp .env.example .env
+```
+
+The defaults work as-is for a local run. These values **must line up with the consumer's `.env`**, or every launch is rejected with `unknown_platform`:
+
+| Variable here | Default | Must match the consumer's |
+|---|---|---|
+| `CONSUMER_BASE_URL` / platform issuer | `http://localhost:4001` | `LTI_ISSUER` |
+| `LTI_CLIENT_ID` | `edulab-content-provider` | `LTI_CLIENT_ID` |
+| `LTI_DEPLOYMENT_IDS` | `deployment-fin-001` | `LTI_DEPLOYMENT_ID` |
+| `ALLOWED_FRAME_ANCESTORS` | `http://localhost:4001,http://localhost:5174` | must contain the consumer's origin, or the iframe is blocked |
+
+Change `CONTENT_SESSION_SECRET` and `ADMIN_PASSWORD` before running this anywhere other than your own machine. Full table: [§5 Environment variables](#5-environment-variables).
+
+### Step 3 — Install dependencies
+
+```bash
+npm install                  # backend: Express, pg, jose, tsx
+npm run frontend:install     # React app under frontend/
+```
+
+### Step 4 — Generate keys, create the schema, register the consumer
+
+```bash
+npm run setup
+```
+
+One command, three steps, safe to re-run:
+
+| Sub-step | What it does |
+|---|---|
+| `npm run keys:generate` | Writes an RSA-2048 keypair to `keys/`. **Skips if one already exists** — pass `-- --force` to replace it |
+| `npm run db:migrate` | Applies `db/schema.sql` to `lti_provider` |
+| `npm run db:register` | Upserts the platform (consumer) registration. **No content is installed** — you upload it at `/admin` |
+
+Coming from an older checkout that had demo content seeded into it? `npm run db:reset-content` empties the catalog (courses, modules and items) and leaves registrations, launches and logs alone.
+
+Failing with `ECONNREFUSED … 5433` means Postgres from Step 1 is not ready — re-check `docker compose ps`.
+
+### Step 5 — Build the React frontend
+
+```bash
+npm run frontend:build       # Vite → public/, served by Express
+```
+
+Required, not optional: the backend serves the **already built** player, deep-linking picker and admin dashboard from `public/`. Skipping this leaves you on a blank page.
+
+### Step 6 — Start the server
+
+```bash
+npm run dev                  # tsx watch, restarts on backend changes
+```
+
+Expect a line like:
+
+```
+listening on            http://localhost:4000
+```
+
+Production-style instead — compiles TypeScript to `dist/`, builds the frontend, runs plain Node:
+
+```bash
+npm run build && npm start
+```
+
+Health checks:
+
+```bash
+curl http://localhost:4000/health           # {"ok":true,"service":"lti-content-provider"}
+curl http://localhost:4000/.well-known/jwks.json
+curl http://localhost:4000/lti/config       # everything a platform admin needs to register this tool
+```
+
+### Step 7 — Bring up the consumer LMS
+
+Separate application, its own README. In a **new terminal**, from the repository root:
+
+```bash
+cd lti-consumer-lms
+cp .env.example .env
+npm install
+npm run frontend:install
+npm run setup            # keys:generate + db:migrate + db:accounts
+npm run frontend:build
+npm run dev              # http://localhost:4001
+```
+
+Full detail: [`../lti-consumer-lms/README.md`](../lti-consumer-lms/README.md).
+
+### Step 8 — Verify the deployment
+
+Automated, from the repository root, with **both** servers running:
+
+```bash
+node scripts/verify-lti-flow.mjs
+```
+
+144 assertions covering the whole flow end to end, security negatives included. The script publishes its own throw-away course through the admin API and deletes it again, so it needs no fixtures.
+
+Or by hand:
+
+1. Open <http://localhost:4000/admin>, password `admin123` (`ADMIN_PASSWORD`), and on the **Content** tab create a course, add a module, then **Add content** — upload a video, PDF, audio file or image.
+2. Open <http://localhost:4001> (the **consumer**, not this app) and sign in as `angad@example.com` / `demo1234`. The course you just created is already listed: nobody on that side selected it.
+3. **My courses → your course → Launch lecture** — this tool's player renders inside the consumer's iframe.
+4. Back in **/admin → Activity log**, confirm the `CONTENT_LAUNCHED` / `CONTENT_VIEW_STARTED` events are there.
+
+Opening <http://localhost:4000> directly is *supposed* to be a dead end: there is no student-facing catalogue, and `/lti/launch` answers `405` without a signed `id_token`.
+
+### Copy-paste: the whole thing
+
+```bash
+# terminal 1 — database + this tool
+docker compose up -d
+cd lti-content-provider && cp .env.example .env
+npm install && npm run frontend:install && npm run setup && npm run frontend:build
+npm run dev
+
+# terminal 2 — the consumer LMS
+cd lti-consumer-lms && cp .env.example .env
+npm install && npm run frontend:install && npm run setup && npm run frontend:build
+npm run dev
+```
+
+### Optional — frontend hot reload
+
+```bash
+npm run frontend:dev         # Vite on :5173, proxying /api, /lti, /.well-known to :4000
+```
+
+Useful while editing React, but **drive the demo from :4000** — that is the origin registered with the platform.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `ECONNREFUSED … 5433` during `npm run setup` | Postgres not running or still starting — `docker compose up -d`, then `docker compose ps` |
+| `database "lti_provider" does not exist` | The container volume predates `infra/init-databases.sql` — `docker compose down -v && docker compose up -d`, then re-run `npm run setup` |
+| Blank page at `:4000/admin` | `npm run frontend:build` was skipped, so `public/` is empty |
+| `EADDRINUSE :4000` | Another process holds the port — free it, or change `PORT` **and** `PROVIDER_BASE_URL` together, plus the tool URLs in the consumer's `.env` |
+| `401 invalid_signature` on launch | This tool cannot reach `http://localhost:4001/.well-known/jwks.json` — the consumer is down, or its keys were regenerated |
+| `401 unknown_platform` on launch | Issuer / `LTI_CLIENT_ID` / deployment id differ between the two `.env` files |
+| `401 invalid_state` on a retried launch | Expected — `state` is single-use. Start a fresh launch from the consumer |
+| Player loads but the iframe is empty in the LMS | The consumer's origin is missing from `ALLOWED_FRAME_ANCESTORS` (CSP `frame-ancestors`) |
+| Video or PDF returns `401` | The media token expired — relaunch. `/media/*` is never public |
+| `Cannot find module 'tsx'` | `npm install` was not run in this folder |
+
+### Deploying beyond localhost
+
+The demo is wired for `http://localhost`. For a shared or hosted deployment:
+
+1. Set `PROVIDER_BASE_URL` to the public **https** origin of this tool, and `CONSUMER_BASE_URL` / the platform endpoints to the consumer's public origin — then make the mirror-image edit in the consumer's `.env`.
+2. Put the consumer's public origin in `ALLOWED_FRAME_ANCESTORS`; without it the browser refuses to embed the player.
+3. Replace `CONTENT_SESSION_SECRET` and `ADMIN_PASSWORD` with real secrets. Never commit `.env` or `keys/` — both are gitignored, and the private key must never be served.
+4. Serve over TLS. The player runs in a cross-site iframe, so the state cookie only becomes `SameSite=None; Secure` under HTTPS.
+5. Point `DATABASE_URL` at a managed Postgres and run `npm run db:migrate`, then `npm run db:register`.
+6. `media/` holds the uploaded files (the database stores only their paths). Mount it from persistent storage — a container filesystem will lose every upload on redeploy — and size `MEDIA_MAX_UPLOAD_MB` for the largest file you expect.
+7. Run `npm run build && npm start` behind a process manager — not `npm run dev`.
+8. Confirm both sides still agree: `npm run registration:print` here and in the consumer.
 
 ---
 
@@ -55,15 +262,17 @@ src/
 │   ├── platformStore.ts registered platforms (issuer + client_id)
 │   ├── stateStore.ts    single-use state and nonce persistence
 │   └── validateLaunch.ts the full validation chain
-├── content/        the content model: Course → Module → Lecture
+├── content/        the content model (repository.ts) + admin CRUD and
+│                   upload handling (manage.ts)
 ├── services/       launch records, viewing sessions, activity log,
 │                   content-session tokens, outbound service calls
-├── routes/         HTTP surface (lti, content, activity, deep-link, admin)
+├── routes/         HTTP surface (lti, content, catalog, activity,
+│                   deep-link, admin, admin content)
 └── middleware/     bearer-token guard for the player API
 
-frontend/           React (Vite) — player, deep-linking picker, admin dashboard
-db/                 schema.sql + seed.sql
-media/              self-hosted lecture videos, streamed from /media
+frontend/           React (Vite) — player, deep-linking picker, admin panel
+db/                 schema.sql (no seed data — content is uploaded)
+media/              files uploaded through /admin, streamed from /media
 ```
 
 The separation the brief asked for maps directly onto those folders: **frontend** (`frontend/`), **backend** (`src/`), **LTI integration** (`src/lti/`), **database** (`src/db/` + `db/`), **content** (`src/content/`), **logging** (`src/services/activityLog.ts`, `src/services/viewingSession.ts`).
@@ -72,7 +281,7 @@ The separation the brief asked for maps directly onto those folders: **frontend*
 
 | Table | Purpose |
 |---|---|
-| `courses`, `modules`, `lectures` | The static content model, including video URLs |
+| `courses`, `modules`, `lectures` | The content model, created by the admin at `/admin`, including content URLs |
 | `lti_platforms` | Registered consumers: issuer, client_id, deployment ids, endpoints |
 | `lti_oidc_state`, `lti_nonces` | Single-use OIDC `state` and `nonce` |
 | `lti_launches` | One row per validated LTI message, with the full decoded `id_token` |
@@ -138,7 +347,17 @@ The tool resolves the lecture from the **`custom.lecture_id`** claim, writes an 
 | When did the launch happen? | `iat` of the `id_token`, stored as `launched_at` |
 | When did viewing start/stop, and for how long? | **Not from LTI** — the provider's player; see [below](#viewing-session-tracking-and-its-limits) |
 
+### How the consumer learns what exists
+
+The admin publishes content here; every registered consumer mirrors it. `GET /api/catalog` serves the catalog — course/module/item ids, titles, content type, duration — and **nothing else**: no `content_url`, no bytes, no signed media links. Those are only ever produced by a validated launch.
+
+The caller authenticates with a short-lived JWT signed by the **platform's** own key, which is the `private_key_jwt` client assertion pattern with the roles reversed; this tool verifies it against the JWKS URL in that platform's registration. No shared secret, and an unsigned request gets a `401`.
+
+The consumer refreshes on every course page load and in the background, so an upload here shows up there within seconds, and a deletion here removes it there.
+
 ### Deep Linking
+
+Deep Linking still works and is still spec-complete, but it is **no longer how content arrives** on the consumer — the catalog mirror above does that without anyone choosing anything.
 
 `LtiDeepLinkingRequest` launches land at the same `/lti/launch` endpoint and are routed by `message_type`. The tool requires an Instructor/Administrator role, shows a lecture picker, then signs an `LtiDeepLinkingResponse` (roles reversed: `iss` = our `client_id`, `aud` = the platform issuer) containing `ltiResourceLink` content items. Each item carries a `custom.lecture_id`, which is how future launches identify the content — the consumer never receives a video URL.
 
@@ -157,14 +376,36 @@ cd lti-content-provider
 cp .env.example .env
 npm install
 npm run frontend:install
-npm run setup           # keys:generate + db:migrate + db:seed
+npm run setup           # keys:generate + db:migrate + db:register
 npm run frontend:build
 npm run dev
 ```
 
-`npm run setup` is idempotent — rerunning it will not overwrite existing keys (pass `--force` to `keys:generate` if you want new ones) and re-seeds content by upsert.
+`npm run setup` is idempotent — rerunning it will not overwrite existing keys (pass `--force` to `keys:generate` if you want new ones) and re-upserts the platform registration.
 
-Seeded content: **Introduction to Financial Markets** → 4 modules → 9 items: 6 videos, 2 PDFs and 1 audio file. Module 4 exists purely to show the launch flow is identical whatever the content is.
+**There is no seeded content.** A fresh install has an empty catalog; you fill it at `/admin`.
+
+### Publishing content (`/admin` → Content)
+
+Sign in with `ADMIN_PASSWORD` and work top down:
+
+1. **New course** — title and description. It appears on every consumer immediately.
+2. **Add module** — the grouping students see as a heading.
+3. **Add content** — upload a file (or paste an external URL), give it a title, and publish.
+
+The upload streams straight to `media/` — the request body *is* the file and the name travels in an `x-filename` header, so a large video is never buffered in memory. The file lands as `<name>.part` and is renamed only once the whole stream has arrived, so a cancelled upload can never be attached to an item. `MEDIA_MAX_UPLOAD_MB` (default 1024) caps a single file, extensions are checked against the supported list, and names are sanitised and de-duplicated.
+
+The content type is inferred from the extension and can be overridden. Duration is optional metadata for `video`/`audio`; the player reads the real timeline from the media itself.
+
+Deleting an item removes it from every consumer on their next sync. Historical launches and activity rows are kept — a launch record is history, and it keeps the claims that name what was launched. A file that an item still points at cannot be deleted (`409`); delete the item first.
+
+| Endpoint (all behind the admin token) | Purpose |
+|---|---|
+| `GET /api/admin/content` | Whole catalog + uploaded files |
+| `POST/PATCH/DELETE /api/admin/content/courses[/:id]` | Courses |
+| `POST/PATCH/DELETE /api/admin/content/modules[/:id]` | Modules |
+| `GET/POST/PATCH/DELETE /api/admin/content/lectures[/:id]` | Content items |
+| `GET/POST/DELETE /api/admin/content/media[/:filename]` | Uploaded files |
 
 ### Content types
 
@@ -190,7 +431,7 @@ For `pdf` and `image` the API returns `hasPlaybackTimeline: false`, and the play
 | `/media/…` | **Self-hosted.** The file sits in `lti-content-provider/media/` and is streamed by this server from `/media`, with HTTP Range support so videos can seek and PDF viewers can fetch a page at a time instead of downloading everything first. |
 | `https://…` | An external URL. |
 
-Four items are **self-hosted** from `media/`: the headline video, two PDFs and an MP3. That makes the point of the whole demo concrete: the bytes come off the provider's own machine, travel through nothing but the consumer's iframe, and never touch the consumer's server. The remaining lectures use Google's public sample MP4s so the catalogue is full without shipping gigabytes.
+Anything you upload through `/admin` is self-hosted, which makes the point of the whole demo concrete: the bytes come off the provider's own machine, travel through nothing but the consumer's iframe, and never touch the consumer's server. An external URL is accepted too, for content you do not want to host here.
 
 ### Self-hosted files are not public
 
@@ -208,21 +449,9 @@ Guessing a filename is therefore not enough — content really is reachable only
 
 Relative paths are expanded against `PROVIDER_BASE_URL` by `toDeliverableUrl()` before the API returns them, so the database stays portable across hosts.
 
-**To add your own file:**
+**To add your own file:** upload it at **/admin → Content → Add content**. Dropping a file into `media/` by hand also works — it shows up in the "uploaded files" list — but the admin panel is the supported route.
 
-```bash
-cp my-handout.pdf lti-content-provider/media/
-```
-
-then point a lecture at it — either edit `db/seed.sql` and re-run `npm run db:seed`, or update the row directly:
-
-```sql
-UPDATE lectures
-   SET content_type = 'pdf', content_url = '/media/my-handout.pdf', poster_url = NULL
- WHERE id = 'lec-2-1';
-```
-
-Nothing changes on the consumer side: it only ever holds the lecture id.
+Nothing changes on the consumer side either way: it only ever holds the item id.
 
 ---
 
@@ -255,14 +484,15 @@ Both projects must agree on `issuer`, `client_id` and `deployment_id`. The defau
 | `LTI_KEY_ID` | `provider-key-1` | `kid` in the JWKS and in signed JWT headers |
 | `CONTENT_SESSION_SECRET` | *(change me)* | Signs the player's short-lived bearer token |
 | `CONTENT_SESSION_TTL_SECONDS` | `14400` | Player token lifetime |
-| `ADMIN_PASSWORD` | `admin123` | Activity dashboard password |
+| `ADMIN_PASSWORD` | `admin123` | Admin panel password (content management + activity) |
+| `MEDIA_MAX_UPLOAD_MB` | `1024` | Largest single file the admin upload accepts |
 | `ALLOWED_FRAME_ANCESTORS` | `http://localhost:4001,http://localhost:5174` | CSP `frame-ancestors` allow-list |
 | `VIEW_HEARTBEAT_TIMEOUT_SECONDS` | `90` | Silence after which a session is auto-closed |
 | `VIEW_REAPER_INTERVAL_SECONDS` | `30` | How often the reaper runs |
 | `LTI_STATE_TTL_SECONDS` | `600` | `state` lifetime |
 | `LTI_NONCE_TTL_SECONDS` | `600` | `nonce` replay-window lifetime |
 | `LTI_MAX_TOKEN_AGE_SECONDS` | `300` | Oldest accepted `id_token` |
-| `PLATFORM_*`, `LTI_CLIENT_ID`, `LTI_DEPLOYMENT_IDS`, `CONSUMER_BASE_URL` | see `src/config/registration.ts` | Override the seeded platform registration |
+| `PLATFORM_*`, `LTI_CLIENT_ID`, `LTI_DEPLOYMENT_IDS`, `CONSUMER_BASE_URL` | see `src/config/registration.ts` | Override the stored platform registration |
 
 ---
 
@@ -293,7 +523,7 @@ What this tool needs to trust a consumer, stored in `lti_platforms`:
 | Token endpoint | `http://localhost:4001/lti/token` |
 | Platform JWKS | `http://localhost:4001/.well-known/jwks.json` |
 
-Seeded by `npm run db:seed` from `src/config/registration.ts`. Inspect at any time:
+Stored by `npm run db:register` from `src/config/registration.ts`. Inspect at any time:
 
 ```bash
 npm run registration:print
@@ -338,9 +568,9 @@ Production-style: `npm run build && npm start`.
 node scripts/verify-lti-flow.mjs
 ```
 
-114 assertions covering the whole flow end to end, including every security negative listed below.
+144 assertions covering the whole flow end to end, including every security negative listed below.
 
-**Through the UI** — sign in to <http://localhost:4001> as `angad@example.com` / `demo1234`, open the course, click **Launch lecture**. The player shows the launch details and the list of validation checks that passed.
+**Through the UI** — publish something at <http://localhost:4000/admin>, then sign in to <http://localhost:4001> as `angad@example.com` / `demo1234`, open the course, click **Launch lecture**. The player shows the launch details and the list of validation checks that passed.
 
 **Things worth trying to prove it is real LTI:**
 
@@ -353,6 +583,8 @@ node scripts/verify-lti-flow.mjs
 | Stop the consumer, then launch | `401 invalid_signature` — the JWKS cannot be fetched |
 | Change `LTI_CLIENT_ID` on one side only | `401 unknown_platform` |
 | Sign in as a student and open Deep Linking | `403` — Instructor role required |
+| `curl http://localhost:4000/api/catalog` | `401` — the catalog needs a platform-signed JWT |
+| `curl http://localhost:4000/api/admin/content` | `401` — content management needs the admin token |
 
 **Watch the server logs** (`npm run dev` output) — each hop prints a line: login initiation → signed token → launch OK → activity events.
 

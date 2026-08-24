@@ -1,15 +1,14 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { pool } from '../src/db/pool.js';
 import { defaultPlatformRegistration } from '../src/config/registration.js';
 import { upsertPlatform } from '../src/lti/platformStore.js';
 
-const sql = readFileSync(resolve(process.cwd(), 'db/seed.sql'), 'utf8');
-
+/**
+ * Stores the trust relationship with the consumer LMS. That is ALL this script
+ * does - the provider ships with no content. Courses, modules and content items
+ * are created by the administrator at /admin, and every consumer picks them up
+ * automatically from /api/catalog.
+ */
 try {
-  await pool.query(sql);
-  console.log('Static content seeded (1 course, 3 modules, 6 lectures).');
-
   const platform = await upsertPlatform(defaultPlatformRegistration);
   console.log('Platform registration stored:');
   console.log(`  name           ${platform.name}`);
@@ -19,8 +18,10 @@ try {
   console.log(`  auth login     ${platform.auth_login_url}`);
   console.log(`  token endpoint ${platform.auth_token_url}`);
   console.log(`  platform JWKS  ${platform.jwks_url}`);
+  console.log('');
+  console.log('No content is installed. Sign in at /admin to upload it.');
 } catch (err) {
-  console.error('Seed failed:', (err as Error).message);
+  console.error('Registration failed:', (err as Error).message);
   process.exitCode = 1;
 } finally {
   await pool.end();
