@@ -11,12 +11,13 @@ import {
   type DeepLinkingSettingsClaim,
   type ResourceLinkClaim,
 } from '../lti/claims.js';
-import { findPlatform } from '../lti/platformStore.js';
+import { findPlatform, isDeploymentActivated, recordActivation } from '../lti/platformStore.js';
 import { createState } from '../lti/stateStore.js';
 import { LtiValidationError, validateLaunch } from '../lti/validateLaunch.js';
 import { getLecture } from '../content/repository.js';
 import { ACTIVITY_EVENT, logActivity } from '../services/activityLog.js';
 import { createLaunchToken, recordLaunch } from '../services/launchStore.js';
+import { reportDeploymentActivated } from '../services/platformService.js';
 import { clientIp, renderErrorPage } from '../utils/http.js';
 
 export const ltiRouter = Router();
@@ -137,6 +138,92 @@ ltiRouter.post('/launch', async (req: Request, res: Response) => {
   const context = claims[CLAIM.CONTEXT] as ContextClaim | undefined;
   const resourceLink = claims[CLAIM.RESOURCE_LINK] as ResourceLinkClaim | undefined;
   const toolPlatform = claims[CLAIM.TOOL_PLATFORM] as { name?: string; guid?: string } | undefined;
+
+  // -------------------------------------------------------------------------
+  // THE INSTRUCTOR-FIRST GATE
+  //
+  // A signature check proves the id_token came from a platform we trust. It
+  // does NOT prove that the deployment_id an administrator pasted in belongs to
+  // the course the students are sitting in - only somebody who can see both
+  // sides can confirm that, and that person is the instructor.
+  //
+  // So the first launch on a deployment must be an Instructor or Administrator.
+  // Their launch records the activation; every student launch after it passes
+  // straight through. Students arriving before it are told to wait, rather than
+  // being shown content that may be wired to the wrong course.
+  // -------------------------------------------------------------------------
+  const instructorLaunch = isInstructorOrAdmin(claims);
+  const activated = isDeploymentActivated(platform, deploymentId);
+
+  if (!activated && !instructorLaunch) {
+    console.warn(
+      `[lti] launch held: deployment ${deploymentId} on ${platform.issuer} has not been set up by an instructor`,
+    );
+    await logActivity({
+      eventType: ACTIVITY_EVENT.LAUNCH_REJECTED,
+      userId: claims.sub,
+      userEmail: claims.email ?? null,
+      userName: claims.name ?? null,
+      platformIssuer: platform.issuer,
+      platformClientId: platform.client_id,
+      platformName: toolPlatform?.name ?? platform.name,
+      deploymentId,
+      ipAddress: ip,
+      userAgent,
+      metadata: { code: 'deployment_not_activated', roles },
+    });
+    return renderErrorPage(
+      res,
+      403,
+      'This content is not open yet',
+      'Your instructor has to open this connection once before the class can use it. ' +
+        'It becomes available to everyone as soon as they have done so.',
+      'deployment_not_activated',
+    );
+  }
+
+  if (instructorLaunch && !activated) {
+    await recordActivation({
+      platformId: platform.id,
+      deploymentId,
+      userId: claims.sub,
+      email: claims.email ?? null,
+      name: claims.name ?? null,
+      contextId: context?.id ?? null,
+      contextTitle: context?.title ?? null,
+    });
+    checks.push({
+      step: 'Deployment activation',
+      detail: `first instructor launch - deployment_id=${deploymentId} is now open to students`,
+    });
+    console.log(
+      `[lti] deployment ${deploymentId} on ${platform.issuer} activated by ${claims.email ?? claims.sub}`,
+    );
+
+    await logActivity({
+      eventType: ACTIVITY_EVENT.DEPLOYMENT_ACTIVATED,
+      userId: claims.sub,
+      userEmail: claims.email ?? null,
+      userName: claims.name ?? null,
+      platformIssuer: platform.issuer,
+      platformClientId: platform.client_id,
+      platformName: toolPlatform?.name ?? platform.name,
+      deploymentId,
+      ipAddress: ip,
+      userAgent,
+      metadata: { roles, context_id: context?.id ?? null, context_title: context?.title ?? null },
+    });
+
+    // Tell the platform its connection is live, so its own UI can stop showing
+    // "waiting for setup". Best-effort: a platform without the service endpoint
+    // is not a reason to fail the instructor's launch.
+    void reportDeploymentActivated(platform, deploymentId, {
+      userId: claims.sub,
+      email: claims.email ?? null,
+      name: claims.name ?? null,
+      contextId: context?.id ?? null,
+    }).catch((err: Error) => console.warn(`[lti] could not report activation: ${err.message}`));
+  }
 
   // -------------------------------------------------------------------------
   // DEEP LINKING REQUEST - the platform is asking "what content do you have?"

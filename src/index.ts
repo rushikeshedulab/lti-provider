@@ -5,9 +5,11 @@ import cookieParser from 'cookie-parser';
 import { env, toolEndpoints } from './config/env.js';
 import { toolRegistrationDocument } from './config/registration.js';
 import { getPublicJwks } from './lti/keys.js';
+import { listPlatformOrigins } from './lti/platformStore.js';
 import { verifyMediaToken } from './services/contentSession.js';
 import { MEDIA_DIR } from './content/uploads.js';
 import { renderErrorPage } from './utils/http.js';
+import { runStartupMigrations } from './db/autoMigrate.js';
 import { purgeExpired } from './lti/stateStore.js';
 import { ltiRouter } from './routes/lti.routes.js';
 import { contentRouter } from './routes/content.routes.js';
@@ -30,12 +32,30 @@ app.use(cookieParser());
 /**
  * The player is designed to be embedded by the consumer LMS, so X-Frame-Options
  * must NOT be set to DENY/SAMEORIGIN. `frame-ancestors` is the modern, granular
- * replacement: only the consumer origins listed in ALLOWED_FRAME_ANCESTORS may
- * embed this tool.
+ * replacement: only known consumer origins may embed this tool.
+ *
+ * The list is the origins of the REGISTERED platforms plus anything in
+ * ALLOWED_FRAME_ANCESTORS, because a platform connected from /admin has to be
+ * able to embed the player immediately - needing an environment change and a
+ * restart is exactly what self-service connections exist to avoid. It is
+ * refreshed on a short interval rather than per request, so the header costs no
+ * database round trip.
  */
+let frameAncestors = ["'self'", ...env.allowedFrameAncestors];
+
+async function refreshFrameAncestors(): Promise<void> {
+  try {
+    const origins = await listPlatformOrigins();
+    frameAncestors = [...new Set(["'self'", ...env.allowedFrameAncestors, ...origins])];
+  } catch (err) {
+    // Keep the previous list: a database blip must not lock every LMS out of
+    // its own iframe.
+    console.warn('[csp] could not refresh frame-ancestors:', (err as Error).message);
+  }
+}
+
 app.use((_req, res, next) => {
-  const ancestors = ["'self'", ...env.allowedFrameAncestors].join(' ');
-  res.setHeader('Content-Security-Policy', `frame-ancestors ${ancestors}`);
+  res.setHeader('Content-Security-Policy', `frame-ancestors ${frameAncestors.join(' ')}`);
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   next();
@@ -143,6 +163,13 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
   res.status(500).json({ error: 'internal_error', message: err.message });
 });
 
+// Bring the database up to date before serving, so connecting a new platform
+// from /admin works on a database created by an older version of this tool.
+await runStartupMigrations().catch((err: Error) => {
+  console.error('[migrate] startup migration failed:', err.message);
+});
+await refreshFrameAncestors();
+
 app.listen(env.port, () => {
   console.log('');
   console.log('  LTI 1.3 CONTENT PROVIDER  (role: Tool)');
@@ -155,6 +182,8 @@ app.listen(env.port, () => {
   console.log('');
   ensureMediaDir();
   startReaper();
+  // Picks up a platform connected from /admin without a restart.
+  setInterval(() => void refreshFrameAncestors(), 60 * 1000).unref();
   purgeExpired().catch(() => {});
   setInterval(() => void purgeExpired().catch(() => {}), 15 * 60 * 1000).unref();
 });

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, formatDuration, formatTime } from '../lib/api';
 import AdminContent from './AdminContent';
+import Connections from './Connections';
 
 interface ActivityRow {
   id: string;
@@ -61,20 +62,6 @@ interface Summary {
   perLecture: { id: string; title: string; module_title: string; sessions: string; watched_seconds: string }[];
 }
 
-interface Registrations {
-  tool: Record<string, unknown>;
-  platforms: {
-    id: number;
-    name: string;
-    issuer: string;
-    client_id: string;
-    deployment_ids: string[];
-    auth_login_url: string;
-    auth_token_url: string;
-    jwks_url: string;
-  }[];
-}
-
 const TOKEN_KEY = 'provider-admin-token';
 const EVENTS = [
   'CONTENT_LAUNCHED',
@@ -98,11 +85,10 @@ export default function Admin() {
   const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
 
-  const [tab, setTab] = useState<'content' | 'activity' | 'sessions' | 'students' | 'registration'>('content');
+  const [tab, setTab] = useState<'content' | 'activity' | 'sessions' | 'students' | 'connections'>('content');
   const [activity, setActivity] = useState<ActivityRow[]>([]);
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
-  const [registrations, setRegistrations] = useState<Registrations | null>(null);
   const [eventFilter, setEventFilter] = useState('');
   const [emailFilter, setEmailFilter] = useState('');
   const [autoRefresh, setAutoRefresh] = useState(true);
@@ -140,16 +126,11 @@ export default function Admin() {
   }, [load]);
 
   useEffect(() => {
-    if (!autoRefresh || !token || tab === 'content') return;
+    if (!autoRefresh || !token || tab === 'content' || tab === 'connections') return;
     const id = setInterval(() => void load(), 10_000);
     return () => clearInterval(id);
   }, [autoRefresh, load, token, tab]);
 
-  useEffect(() => {
-    if (tab === 'registration' && token && !registrations) {
-      authed<Registrations>('/api/admin/registrations').then(setRegistrations).catch(() => undefined);
-    }
-  }, [tab, token, registrations, authed]);
 
   const login = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -198,15 +179,17 @@ export default function Admin() {
     <div className="page">
       <div className="row" style={{ marginBottom: 18 }}>
         <div>
-          <h1 style={{ marginBottom: 2 }}>{tab === 'content' ? 'Course content' : 'Content activity'}</h1>
+          <h1 style={{ marginBottom: 2 }}>{tab === 'content' ? 'Course content' : tab === 'connections' ? 'LTI connections' : 'Content activity'}</h1>
           <p className="muted small" style={{ margin: 0 }}>
             {tab === 'content'
               ? 'What you publish here is what every consumer LMS shows - it is mirrored automatically.'
-              : 'Every row here was produced by this provider - launches from LTI, durations from the player.'}
+              : tab === 'connections'
+                ? 'Connect any LMS with the client_id and deployment_id its administrator generated.'
+                : 'Every row here was produced by this provider - launches from LTI, durations from the player.'}
           </p>
         </div>
         <div style={{ marginLeft: 'auto' }} className="row">
-          {tab !== 'content' && (
+          {tab !== 'content' && tab !== 'connections' && (
             <>
               <label className="row small" style={{ margin: 0, gap: 6 }}>
                 <input
@@ -234,7 +217,7 @@ export default function Admin() {
         </div>
       </div>
 
-      {summary && tab !== 'content' && (
+      {summary && tab !== 'content' && tab !== 'connections' && (
         <div className="grid stats" style={{ marginBottom: 18 }}>
           <div className="stat">
             <div className="label">LTI launches</div>
@@ -264,19 +247,21 @@ export default function Admin() {
       )}
 
       <div className="row" style={{ marginBottom: 14 }}>
-        {(['content', 'activity', 'sessions', 'students', 'registration'] as const).map((t) => (
+        {(['content', 'activity', 'sessions', 'students', 'connections'] as const).map((t) => (
           <button key={t} className={tab === t ? 'small' : 'secondary small'} onClick={() => setTab(t)}>
             {t === 'content' && 'Content'}
             {t === 'activity' && 'Activity log'}
             {t === 'sessions' && 'Viewing sessions'}
             {t === 'students' && 'Per student / lecture'}
             {t === 'content' && 'Content library'}
-            {t === 'registration' && 'LTI registration'}
+            {t === 'connections' && 'LTI connections'}
           </button>
         ))}
       </div>
 
       {tab === 'content' && <AdminContent token={token} />}
+
+      {tab === 'connections' && <Connections token={token} />}
 
       {tab === 'activity' && (
         <div className="card">
@@ -512,37 +497,6 @@ export default function Admin() {
         </div>
       )}
 
-      {tab === 'registration' && (
-        <div className="grid two">
-          <div className="card">
-            <h2>This tool</h2>
-            <pre className="mono small" style={{ whiteSpace: 'pre-wrap' }}>
-              {JSON.stringify(registrations?.tool ?? {}, null, 2)}
-            </pre>
-          </div>
-          <div className="card">
-            <h2>Trusted platforms</h2>
-            {registrations?.platforms.map((p) => (
-              <dl className="kv" key={p.id} style={{ marginBottom: 16 }}>
-                <dt>Name</dt>
-                <dd>{p.name}</dd>
-                <dt>Issuer</dt>
-                <dd className="mono">{p.issuer}</dd>
-                <dt>client_id</dt>
-                <dd className="mono">{p.client_id}</dd>
-                <dt>deployment_ids</dt>
-                <dd className="mono">{p.deployment_ids.join(', ')}</dd>
-                <dt>Auth endpoint</dt>
-                <dd className="mono">{p.auth_login_url}</dd>
-                <dt>Token endpoint</dt>
-                <dd className="mono">{p.auth_token_url}</dd>
-                <dt>Platform JWKS</dt>
-                <dd className="mono">{p.jwks_url}</dd>
-              </dl>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 }

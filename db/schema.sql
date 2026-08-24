@@ -82,8 +82,38 @@ CREATE TABLE IF NOT EXISTS lti_platforms (
   tool_redirect_uri   TEXT NOT NULL,
   is_active           BOOLEAN NOT NULL DEFAULT TRUE,
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  -- SELF-SERVICE CONNECTIONS
+  -- A new consumer is connected by pasting the client_id and deployment_id its
+  -- administrator generated, so the columns below exist to describe a row that
+  -- nobody put in an environment file.
+  --   created_via 'env'   seeded from configuration at setup time
+  --               'admin' typed into /admin by an administrator
+  --   status      'pending' until an Instructor completes the first launch on
+  --               one of the deployments, 'active' from then on.
+  created_via         TEXT NOT NULL DEFAULT 'env',
+  status              TEXT NOT NULL DEFAULT 'pending',
+  notes               TEXT,
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  -- THE INSTRUCTOR-FIRST GATE, keyed by deployment_id:
+  --   { "<deployment_id>": { activated_at, user_id, email, name, launch_id,
+  --                          context_id, context_title, reported } }
+  -- A deployment is inert until an Instructor or Administrator launches it
+  -- once. That launch is the only thing proving both halves of the
+  -- registration really agree, so students are turned away until it happens.
+  activated_deployments JSONB NOT NULL DEFAULT '{}'::jsonb,
+
   UNIQUE (issuer, client_id)
 );
+
+-- CREATE TABLE IF NOT EXISTS leaves an existing table untouched, so databases
+-- created before self-service connections are upgraded here.
+ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS created_via TEXT NOT NULL DEFAULT 'env';
+ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS status      TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS notes       TEXT;
+ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMPTZ NOT NULL DEFAULT now();
+ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS activated_deployments JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 -- ---------------------------------------------------------------------------
 -- OIDC STATE + NONCE STORES
