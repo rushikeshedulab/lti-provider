@@ -5,6 +5,7 @@ import { query } from '../db/pool.js';
 import { listPlatforms } from '../lti/platformStore.js';
 import { toolRegistrationDocument } from '../config/registration.js';
 import { getLaunch } from '../services/launchStore.js';
+import { adminContentRouter } from './adminContent.routes.js';
 
 export const adminRouter = Router();
 
@@ -41,6 +42,9 @@ async function requireAdmin(req: Request, res: Response, next: NextFunction): Pr
 }
 
 adminRouter.use(requireAdmin);
+
+// Content management: create/upload everything students will see.
+adminRouter.use('/content', adminContentRouter);
 
 /**
  * The activity feed shown on the dashboard. CONTENT_VIEW_* rows are joined to

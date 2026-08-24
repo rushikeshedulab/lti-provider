@@ -1,5 +1,8 @@
+/* Light theme only. `color-scheme: light` also keeps the browser's own
+   widgets - form controls, scrollbars, the autofill highlight - on the light
+   palette when the operating system is set to dark. */
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
   --bg: #f5f6f8;
   --surface: #ffffff;
   --surface-2: #fafbfc;
@@ -16,26 +19,6 @@
   --bad-soft: #fdecec;
   --radius: 10px;
   --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.04);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0f1115;
-    --surface: #171a1f;
-    --surface-2: #1d2026;
-    --border: #2a2e36;
-    --text: #e7e9ec;
-    --muted: #9aa1ac;
-    --accent: #7ba2ff;
-    --accent-soft: #1a2440;
-    --good: #56d39c;
-    --good-soft: #12301f;
-    --warn: #e5b25c;
-    --warn-soft: #33260f;
-    --bad: #f2b8b5;
-    --bad-soft: #3a1d1c;
-    --shadow: none;
-  }
 }
 
 * { box-sizing: border-box; }
@@ -111,11 +94,13 @@ button:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
 button.secondary, .btn.secondary { background: var(--surface); color: var(--text); border-color: var(--border); }
 button.small { padding: 5px 11px; font-size: 13px; }
 
-input, select {
+input, select, textarea {
   font: inherit; padding: 9px 11px;
   border: 1px solid var(--border); border-radius: 8px;
   background: var(--surface); color: var(--text); width: 100%;
 }
+textarea { resize: vertical; min-height: 64px; }
+input[type="file"] { padding: 7px 9px; cursor: pointer; }
 label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }
 .field { margin-bottom: 14px; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
