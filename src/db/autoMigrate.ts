@@ -37,10 +37,8 @@ const STATEMENTS: { label: string; sql: string }[] = [
   {
     /**
      * `status` is only ever a summary of `activated_deployments`, so recompute
-     * it rather than trust it. This keeps the admin panel honest after a row
-     * was edited by hand, and it is what puts registrations that predate the
-     * gate into 'pending' - including the one created by `npm run setup`.
-     * Their first instructor launch opens them, exactly like a new connection.
+     * it rather than trust it. It reports whether a launch has ever arrived
+     * through the connection; it does not gate anything.
      */
     label: 'lti_platforms: reconcile status with activations',
     sql: `UPDATE lti_platforms

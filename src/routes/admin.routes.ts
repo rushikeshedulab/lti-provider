@@ -14,7 +14,12 @@ import {
   upsertPlatform,
   type PlatformRegistration,
 } from '../lti/platformStore.js';
-import { discoverPlatform, DiscoveryError, probeJwks } from '../services/platformDiscovery.js';
+import {
+  diagnoseConnection,
+  discoverPlatform,
+  DiscoveryError,
+  probeJwks,
+} from '../services/platformDiscovery.js';
 import { toolRegistrationDocument } from '../config/registration.js';
 import { getLaunch } from '../services/launchStore.js';
 import { adminContentRouter } from './adminContent.routes.js';
@@ -187,12 +192,12 @@ adminRouter.get('/registrations', async (_req, res) => {
 // about the platform is discovered from the URL it lives at, so no environment
 // variable changes and no restart are involved.
 //
-// A saved connection is 'pending' until an Instructor completes one launch
-// through it. Students are refused until that has happened - see
-// routes/lti.routes.ts, which is where the gate is actually enforced.
+// A saved connection is usable immediately. 'pending' simply means no launch
+// has arrived through it yet; it turns 'active' the first time one does, which
+// is how you tell a working connection from a merely saved one.
 // ===========================================================================
 
-/** Shape sent to the admin UI: the registration plus its per-deployment gate. */
+/** Shape sent to the admin UI: the registration plus per-deployment usage. */
 function connectionView(platform: PlatformRegistration) {
   const activations = platform.activated_deployments ?? {};
   return {
@@ -219,7 +224,6 @@ function connectionView(platform: PlatformRegistration) {
         activatedBy: activation?.name ?? activation?.email ?? null,
         activatedByEmail: activation?.email ?? null,
         contextTitle: activation?.context_title ?? null,
-        reportedToPlatform: activation?.reported ?? false,
       };
     }),
   };
@@ -390,9 +394,8 @@ adminRouter.delete('/connections/:id/deployments/:deploymentId', async (req, res
 });
 
 /**
- * Puts a deployment back behind the gate. The next launch must then be an
- * Instructor again - useful when a course is handed to a new teacher, or to
- * demonstrate the gate without recreating the connection.
+ * Forgets that a deployment has been launched. Nothing is blocked either way -
+ * it just clears the "first seen" record so a fresh test reads cleanly.
  */
 adminRouter.post('/connections/:id/reset-activation', async (req, res) => {
   const deploymentId = String(req.body?.deploymentId ?? '').trim();
@@ -405,7 +408,7 @@ adminRouter.post('/connections/:id/reset-activation', async (req, res) => {
     res.status(404).json({ error: 'unknown_connection' });
     return;
   }
-  console.log(`[admin] activation reset for deployment ${deploymentId} on platform ${platform.id}`);
+  console.log(`[admin] cleared the first-use record for deployment ${deploymentId} on platform ${platform.id}`);
   res.json({ connection: connectionView(platform) });
 });
 
@@ -420,14 +423,57 @@ adminRouter.patch('/connections/:id', async (req, res) => {
   res.json({ connection: connectionView(platform) });
 });
 
-/** Re-checks that the platform still publishes a readable key set. */
+/**
+ * Checks a saved connection against the live platform: are the endpoints real,
+ * is the key set readable, and does the issuer still match what the platform
+ * publishes. Answers the question "is my config wrong, or is the LMS simply
+ * asking the user to sign in".
+ */
 adminRouter.post('/connections/:id/test', async (req, res) => {
   const platform = await findPlatformById(Number(req.params.id));
   if (!platform) {
     res.status(404).json({ error: 'unknown_connection' });
     return;
   }
-  res.json({ jwks: await probeJwks(platform.jwks_url) });
+  const diagnosis = await diagnoseConnection({
+    issuer: platform.issuer,
+    authLoginUrl: platform.auth_login_url,
+    authTokenUrl: platform.auth_token_url,
+    jwksUrl: platform.jwks_url,
+  });
+  res.json({ diagnosis, jwks: diagnosis.jwks });
+});
+
+/** Corrects the endpoints of an existing connection without recreating it. */
+adminRouter.patch('/connections/:id/endpoints', async (req, res) => {
+  const platform = await findPlatformById(Number(req.params.id));
+  if (!platform) {
+    res.status(404).json({ error: 'unknown_connection' });
+    return;
+  }
+  const body = req.body ?? {};
+  const next = {
+    name: String(body.name ?? platform.name).trim() || platform.name,
+    issuer: String(body.issuer ?? platform.issuer).trim(),
+    clientId: platform.client_id,
+    deploymentIds: platform.deployment_ids,
+    authLoginUrl: String(body.authLoginUrl ?? platform.auth_login_url).trim(),
+    authTokenUrl: String(body.authTokenUrl ?? platform.auth_token_url).trim(),
+    jwksUrl: String(body.jwksUrl ?? platform.jwks_url).trim(),
+    toolRedirectUri: toolEndpoints.redirectUri,
+    createdVia: platform.created_via,
+    notes: platform.notes,
+  };
+
+  // The issuer is part of the row's identity, so changing it cannot be an
+  // upsert - it would leave the old row behind and match neither.
+  if (next.issuer !== platform.issuer) {
+    await query(`UPDATE lti_platforms SET issuer = $2, updated_at = now() WHERE id = $1`, [platform.id, next.issuer]);
+  }
+  const updated = await upsertPlatform(next);
+
+  console.log(`[admin] connection ${updated.id} endpoints updated (issuer=${updated.issuer})`);
+  res.json({ connection: connectionView(updated) });
 });
 
 adminRouter.delete('/connections/:id', async (req, res) => {

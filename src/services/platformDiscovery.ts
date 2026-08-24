@@ -211,6 +211,102 @@ async function discoverAt(baseUrl: string): Promise<DiscoveredPlatform | null> {
   return null;
 }
 
+export interface EndpointReport {
+  url: string;
+  ok: boolean;
+  status: number | null;
+  detail: string;
+}
+
+export interface Diagnosis {
+  jwks: { ok: boolean; keys: number; error?: string };
+  authorization: EndpointReport;
+  token: EndpointReport;
+  /** Set when the platform's own config disagrees with what was saved. */
+  issuerMismatch: { saved: string; published: string } | null;
+  notes: string[];
+}
+
+/** Reaches an endpoint just far enough to tell "wrong URL" from "works". */
+async function probeEndpoint(url: string): Promise<EndpointReport> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    // `redirect: manual` matters: an authorization endpoint answering a
+    // session-less request with a redirect to its own login page is normal, and
+    // following it would hide the fact that the endpoint exists at all.
+    const response = await fetch(url, { method: 'GET', redirect: 'manual', signal: controller.signal });
+    const status = response.status;
+
+    if (status === 404 || status === 405) {
+      return { url, ok: false, status, detail: `Nothing is served here (HTTP ${status}). The path is wrong.` };
+    }
+    if (status >= 500) {
+      return { url, ok: false, status, detail: `The platform returned HTTP ${status}.` };
+    }
+    if (status >= 300 && status < 400) {
+      return {
+        url,
+        ok: true,
+        status,
+        detail:
+          `Answers, and redirects a request with no session - normal for an authorization endpoint. ` +
+          `If a user sees a login page during a launch, that redirect is the platform asking them to sign in.`,
+      };
+    }
+    return { url, ok: true, status, detail: `Answers with HTTP ${status}.` };
+  } catch (err) {
+    return { url, ok: false, status: null, detail: `Unreachable: ${(err as Error).message}` };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Checks a saved connection against the platform as it is right now. The point
+ * is to separate "this tool is pointed at the wrong URL", which is fixable
+ * here, from "the platform wants the user to sign in", which is not.
+ */
+export async function diagnoseConnection(input: {
+  issuer: string;
+  authLoginUrl: string;
+  authTokenUrl: string;
+  jwksUrl: string;
+}): Promise<Diagnosis> {
+  const [jwks, authorization, token] = await Promise.all([
+    probeJwks(input.jwksUrl),
+    probeEndpoint(input.authLoginUrl),
+    probeEndpoint(input.authTokenUrl),
+  ]);
+
+  const notes: string[] = [];
+  let issuerMismatch: Diagnosis['issuerMismatch'] = null;
+
+  // The `iss` a platform sends at login initiation must equal what is saved
+  // here, character for character, or no registration will be found.
+  const published = await discoverAt(input.issuer).catch(() => null);
+  if (published && published.issuer !== input.issuer) {
+    issuerMismatch = { saved: input.issuer, published: published.issuer };
+    notes.push(
+      `This platform publishes its issuer as "${published.issuer}" but the connection stores "${input.issuer}". ` +
+        `Launches will be refused as "unregistered platform" until they match.`,
+    );
+  }
+
+  if (!jwks.ok) notes.push(`Launch signatures cannot be verified: ${jwks.error}`);
+  if (!authorization.ok) notes.push(`The authorization endpoint looks wrong: ${authorization.detail}`);
+  if (!token.ok) notes.push(`The token endpoint looks wrong: ${token.detail}`);
+
+  if (!notes.length) {
+    notes.push(
+      'Every endpoint answers and the key set is readable. A sign-in prompt during a launch is then the ' +
+        'platform authenticating its own user, which this tool cannot and should not suppress.',
+    );
+  }
+
+  return { jwks, authorization, token, issuerMismatch, notes };
+}
+
 /**
  * Confirms the platform really does publish a usable key set. A registration
  * whose JWKS cannot be read would accept the pasted ids and then fail every

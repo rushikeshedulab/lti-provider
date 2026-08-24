@@ -32,7 +32,6 @@ export interface DeploymentActivation {
   launch_id: string | null;
   context_id: string | null;
   context_title: string | null;
-  reported: boolean;
 }
 
 export type ActivationMap = Record<string, DeploymentActivation>;
@@ -231,7 +230,6 @@ export async function recordActivation(input: {
     launch_id: input.launchId ?? null,
     context_id: input.contextId ?? null,
     context_title: input.contextTitle ?? null,
-    reported: false,
   };
 
   const row = await queryOne<PlatformRegistration>(
@@ -244,17 +242,6 @@ export async function recordActivation(input: {
     [input.platformId, input.deploymentId, JSON.stringify(entry)],
   );
   return row!;
-}
-
-/** Notes that the platform was told about the activation over a service call. */
-export function markActivationReported(platformId: number, deploymentId: string) {
-  return query(
-    `UPDATE lti_platforms
-        SET activated_deployments =
-              jsonb_set(activated_deployments, ARRAY[$2::text, 'reported'], 'true'::jsonb, false)
-      WHERE id = $1 AND activated_deployments ? $2::text`,
-    [platformId, deploymentId],
-  );
 }
 
 /** Undo an activation, so the next instructor launch has to set it up again. */

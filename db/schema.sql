@@ -89,19 +89,19 @@ CREATE TABLE IF NOT EXISTS lti_platforms (
   -- nobody put in an environment file.
   --   created_via 'env'   seeded from configuration at setup time
   --               'admin' typed into /admin by an administrator
-  --   status      'pending' until an Instructor completes the first launch on
-  --               one of the deployments, 'active' from then on.
+  --   status      'pending' until a launch actually arrives through the
+  --               connection, 'active' from then on. It gates nothing; it
+  --               distinguishes a working connection from a saved one.
   created_via         TEXT NOT NULL DEFAULT 'env',
   status              TEXT NOT NULL DEFAULT 'pending',
   notes               TEXT,
   updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-  -- THE INSTRUCTOR-FIRST GATE, keyed by deployment_id:
+  -- FIRST LAUNCH SEEN per deployment_id:
   --   { "<deployment_id>": { activated_at, user_id, email, name, launch_id,
-  --                          context_id, context_title, reported } }
-  -- A deployment is inert until an Instructor or Administrator launches it
-  -- once. That launch is the only thing proving both halves of the
-  -- registration really agree, so students are turned away until it happens.
+  --                          context_id, context_title } }
+  -- Purely a record that the deployment has been exercised, and by whom. No
+  -- launch is ever refused on account of it.
   activated_deployments JSONB NOT NULL DEFAULT '{}'::jsonb,
 
   UNIQUE (issuer, client_id)
