@@ -1,10 +1,20 @@
-import { existsSync } from 'node:fs';
-import { basename, join } from 'node:path';
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { SignJWT, jwtVerify } from 'jose';
 import { env, toolEndpoints } from '../config/env.js';
 import { query } from '../db/pool.js';
-import { listPlatforms } from '../lti/platformStore.js';
+import {
+  addDeploymentId,
+  clearActivation,
+  deletePlatform,
+  findPlatformByClientId,
+  findPlatformById,
+  listPlatforms,
+  removeDeploymentId,
+  setPlatformActive,
+  upsertPlatform,
+  type PlatformRegistration,
+} from '../lti/platformStore.js';
+import { discoverPlatform, DiscoveryError, probeJwks } from '../services/platformDiscovery.js';
 import { toolRegistrationDocument } from '../config/registration.js';
 import { getLaunch } from '../services/launchStore.js';
 import { adminContentRouter } from './adminContent.routes.js';
@@ -169,181 +179,286 @@ adminRouter.get('/registrations', async (_req, res) => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// CONTENT AUTHORING
-// Everything below creates or removes the provider's own content. It is behind
-// requireAdmin like the rest of this router, and it has no LTI surface at all -
-// the consumer only ever sees a lecture that an instructor picked through Deep
-// Linking, and only ever as an id plus a title.
-// ---------------------------------------------------------------------------
+// ===========================================================================
+// PLATFORM CONNECTIONS
+//
+// Connecting a new LMS is a two-field job: its administrator generates a
+// client_id and a deployment_id, and they get pasted in here. Everything else
+// about the platform is discovered from the URL it lives at, so no environment
+// variable changes and no restart are involved.
+//
+// A saved connection is 'pending' until an Instructor completes one launch
+// through it. Students are refused until that has happened - see
+// routes/lti.routes.ts, which is where the gate is actually enforced.
+// ===========================================================================
 
-/** Courses, modules and every lecture with its file details. */
-adminRouter.get('/content/catalog', async (_req, res) => {
-  const [catalog, lectures] = await Promise.all([getCourseCatalog(), listLecturesForAuthoring()]);
+/** Shape sent to the admin UI: the registration plus its per-deployment gate. */
+function connectionView(platform: PlatformRegistration) {
+  const activations = platform.activated_deployments ?? {};
+  return {
+    id: platform.id,
+    name: platform.name,
+    issuer: platform.issuer,
+    clientId: platform.client_id,
+    authLoginUrl: platform.auth_login_url,
+    authTokenUrl: platform.auth_token_url,
+    jwksUrl: platform.jwks_url,
+    toolRedirectUri: platform.tool_redirect_uri,
+    isActive: platform.is_active,
+    createdVia: platform.created_via,
+    status: platform.status,
+    notes: platform.notes,
+    createdAt: platform.created_at,
+    updatedAt: platform.updated_at,
+    deployments: platform.deployment_ids.map((deploymentId) => {
+      const activation = activations[deploymentId];
+      return {
+        deploymentId,
+        activated: Boolean(activation),
+        activatedAt: activation?.activated_at ?? null,
+        activatedBy: activation?.name ?? activation?.email ?? null,
+        activatedByEmail: activation?.email ?? null,
+        contextTitle: activation?.context_title ?? null,
+        reportedToPlatform: activation?.reported ?? false,
+      };
+    }),
+  };
+}
+
+adminRouter.get('/connections', async (_req, res) => {
+  const platforms = await listPlatforms();
   res.json({
-    catalog,
-    lectures: lectures.map((l) => ({
-      id: l.id,
-      title: l.title,
-      description: l.description,
-      contentType: l.content_type,
-      contentUrl: l.content_url,
-      selfHosted: isSelfHosted(l.content_url),
-      posterUrl: l.poster_url,
-      durationSeconds: l.duration_seconds,
-      moduleId: l.module_id,
-      moduleTitle: l.module_title,
-      courseId: l.course_id,
-      courseTitle: l.course_title,
-    })),
-    limits: { maxUploadMb: env.maxUploadMb, acceptedTypes: acceptedUploadTypes() },
+    connections: platforms.map(connectionView),
+    // Everything the LMS administrator needs from us, to paste the other way.
+    tool: { ...toolRegistrationDocument, endpoints: toolEndpoints, key_id: env.keyId },
   });
 });
 
 /**
- * Raw-body upload. The browser sends the File itself as the request body with
- * `content-type: application/octet-stream`, which the app-level JSON and
- * urlencoded parsers both ignore, so `req` is still an unread stream here and
- * goes straight to disk. The original filename rides along as a query
- * parameter because a stream has nowhere else to put it.
- *
- * This only puts bytes on disk. The lecture row is a separate call, so a file
- * that is uploaded but never described stays invisible to every launch.
+ * Reads the platform's own discovery document so the administrator does not
+ * have to know its issuer or endpoint URLs. Purely a form-filling aid: nothing
+ * is saved, and every launch is still verified against the JWKS at launch time.
  */
-adminRouter.post('/content/upload', async (req, res) => {
-  const originalName = String(req.query.filename ?? '').trim();
-  if (!originalName) {
-    res.status(400).json({ error: 'missing_filename', message: 'A ?filename= query parameter is required.' });
-    return;
-  }
-
+adminRouter.post('/connections/discover', async (req, res) => {
+  const url = String(req.body?.url ?? '').trim();
   try {
-    const { contentType, mimeType, extension } = classifyUpload(originalName);
-    const filename = safeMediaName(originalName, extension);
-    const { path, bytes } = await saveUploadStream(req, filename);
-
-    console.log(`[admin] uploaded ${path} (${contentType}, ${(bytes / 1024 / 1024).toFixed(1)} MB)`);
-    res.status(201).json({ path, bytes, contentType, mimeType, filename, originalName });
+    const discovered = await discoverPlatform(url);
+    const jwks = await probeJwks(discovered.jwksUrl);
+    res.json({ discovered, jwks });
   } catch (err) {
-    if (err instanceof UploadError) {
-      res.status(err.status).json({ error: err.code, message: err.message });
+    if (err instanceof DiscoveryError) {
+      res.status(400).json({ error: err.code, message: err.message });
       return;
     }
     throw err;
   }
 });
 
-/** Discards an uploaded file that never became a lecture. */
-adminRouter.delete('/content/upload', async (req, res) => {
-  const path = String(req.body?.path ?? '');
-  if (!path.startsWith('/media/')) {
-    res.status(400).json({ error: 'not_a_provider_file' });
-    return;
-  }
-  const inUse = await query(`SELECT 1 FROM lectures WHERE content_url = $1 OR poster_url = $1`, [path]);
-  if (inUse.length > 0) {
-    res.status(409).json({ error: 'file_in_use', message: 'A lecture still points at this file.' });
-    return;
-  }
-  await deleteMediaFile(path);
-  res.json({ ok: true });
-});
-
-adminRouter.post('/content/courses', async (req, res) => {
-  const title = String(req.body?.title ?? '').trim();
-  if (!title) {
-    res.status(400).json({ error: 'missing_title' });
-    return;
-  }
-  res.status(201).json({ course: await createCourse({ title, description: String(req.body?.description ?? '') }) });
-});
-
-adminRouter.post('/content/modules', async (req, res) => {
-  const title = String(req.body?.title ?? '').trim();
-  const courseId = String(req.body?.courseId ?? '').trim();
-  if (!title || !courseId) {
-    res.status(400).json({ error: 'missing_fields', message: 'courseId and title are required.' });
-    return;
-  }
-  const module = await createModule({ courseId, title });
-  if (!module) {
-    res.status(404).json({ error: 'unknown_course' });
-    return;
-  }
-  res.status(201).json({ module });
-});
-
 /**
- * Turns an uploaded file (or an external URL) into a launchable lecture. From
- * this point the lecture appears in the Deep Linking picker, and its id is what
- * will come back on every future LtiResourceLinkRequest as `custom.lecture_id`.
+ * Saves a connection. `clientId` and `deploymentId` are the only two values an
+ * administrator must supply; the endpoints are discovered from `url` unless
+ * they are overridden explicitly in the request.
  */
-adminRouter.post('/content/lectures', async (req, res) => {
+adminRouter.post('/connections', async (req, res) => {
   const body = req.body ?? {};
-  const title = String(body.title ?? '').trim();
-  const moduleId = String(body.moduleId ?? '').trim();
-  const contentUrl = String(body.contentUrl ?? '').trim();
+  const clientId = String(body.clientId ?? '').trim();
+  const deploymentId = String(body.deploymentId ?? '').trim();
+  const url = String(body.url ?? '').trim();
 
-  if (!title || !moduleId || !contentUrl) {
-    res.status(400).json({ error: 'missing_fields', message: 'moduleId, title and contentUrl are required.' });
+  if (!clientId || !deploymentId) {
+    res.status(400).json({
+      error: 'missing_ids',
+      message: 'Both client_id and deployment_id are required - they come from the LMS administrator.',
+    });
     return;
   }
 
-  // Self-hosted files were classified at upload time; an external URL is
-  // classified by its extension, and falls back to whatever the caller chose.
-  let contentType = String(body.contentType ?? '') as ContentType;
-  if (!['video', 'audio', 'pdf', 'image'].includes(contentType)) {
-    res.status(400).json({ error: 'bad_content_type', message: 'contentType must be video, audio, pdf or image.' });
-    return;
-  }
+  // A client_id must identify exactly one platform, otherwise a launch that
+  // arrives with only `azp` set could not be resolved to a registration.
+  const clash = await findPlatformByClientId(clientId);
 
-  if (isSelfHosted(contentUrl)) {
-    const onDisk = existsSync(join(MEDIA_DIR, basename(contentUrl)));
-    if (!onDisk) {
-      res.status(400).json({ error: 'file_missing', message: `No uploaded file at ${contentUrl}.` });
+  let issuer = String(body.issuer ?? '').trim();
+  let authLoginUrl = String(body.authLoginUrl ?? '').trim();
+  let authTokenUrl = String(body.authTokenUrl ?? '').trim();
+  let jwksUrl = String(body.jwksUrl ?? '').trim();
+  let name = String(body.name ?? '').trim();
+  let discoverySource: string | null = null;
+  let discoveryWarning: string | null = null;
+
+  const needsDiscovery = !issuer || !authLoginUrl || !authTokenUrl || !jwksUrl;
+  if (needsDiscovery) {
+    if (!url) {
+      res.status(400).json({
+        error: 'missing_url',
+        message: 'Supply the LMS address so its endpoints can be discovered, or fill in all four URLs by hand.',
+      });
       return;
     }
-  } else if (!/^https?:\/\//i.test(contentUrl)) {
-    res.status(400).json({ error: 'bad_content_url', message: 'contentUrl must be an uploaded /media path or an http(s) URL.' });
+    try {
+      const discovered = await discoverPlatform(url);
+      issuer ||= discovered.issuer;
+      authLoginUrl ||= discovered.authLoginUrl;
+      authTokenUrl ||= discovered.authTokenUrl;
+      jwksUrl ||= discovered.jwksUrl;
+      name ||= discovered.name ?? new URL(discovered.issuer).host;
+      discoverySource = discovered.source;
+      discoveryWarning = discovered.warning;
+    } catch (err) {
+      if (err instanceof DiscoveryError) {
+        res.status(400).json({ error: err.code, message: err.message });
+        return;
+      }
+      throw err;
+    }
+  }
+
+  if (clash && clash.issuer !== issuer) {
+    res.status(409).json({
+      error: 'client_id_in_use',
+      message: `client_id "${clientId}" is already registered for issuer "${clash.issuer}". Ask the LMS to generate a different one.`,
+    });
     return;
   }
 
-  const lecture = await createLecture({
-    moduleId,
-    title,
-    description: String(body.description ?? ''),
-    contentType,
-    contentUrl,
-    posterUrl: body.posterUrl ? String(body.posterUrl) : null,
-    durationSeconds: Number(body.durationSeconds) || 0,
+  // Fail here rather than at the first launch: a registration whose key set
+  // cannot be read would accept the ids and then reject every launch with an
+  // opaque signature error.
+  const jwks = await probeJwks(jwksUrl);
+  if (!jwks.ok && body.ignoreJwksCheck !== true) {
+    res.status(400).json({
+      error: 'jwks_unreachable',
+      message: `${jwks.error} Check the LMS address, or save again with "ignore key check" if it is not reachable yet.`,
+    });
+    return;
+  }
+
+  const platform = await upsertPlatform({
+    name: name || issuer,
+    issuer,
+    clientId,
+    deploymentIds: [deploymentId],
+    authLoginUrl,
+    authTokenUrl,
+    jwksUrl,
+    toolRedirectUri: toolEndpoints.redirectUri,
+    createdVia: 'admin',
+    notes: body.notes ? String(body.notes) : null,
   });
 
-  if (!lecture) {
-    res.status(404).json({ error: 'unknown_module' });
+  console.log(
+    `[admin] connection saved: ${platform.issuer} client_id=${platform.client_id} ` +
+      `deployment_ids=${platform.deployment_ids.join(',')}`,
+  );
+
+  res.status(201).json({
+    connection: connectionView(platform),
+    discovery: { source: discoverySource, warning: discoveryWarning },
+    jwks,
+  });
+});
+
+/** Adds a second (third, ...) deployment_id to a connection that already exists. */
+adminRouter.post('/connections/:id/deployments', async (req, res) => {
+  const deploymentId = String(req.body?.deploymentId ?? '').trim();
+  if (!deploymentId) {
+    res.status(400).json({ error: 'missing_deployment_id' });
     return;
   }
+  const platform = await addDeploymentId(Number(req.params.id), deploymentId);
+  if (!platform) {
+    res.status(404).json({ error: 'unknown_connection' });
+    return;
+  }
+  res.json({ connection: connectionView(platform) });
+});
 
-  console.log(`[admin] created lecture ${lecture.id} (${lecture.content_type}) in module ${moduleId}`);
-  res.status(201).json({ lecture });
+adminRouter.delete('/connections/:id/deployments/:deploymentId', async (req, res) => {
+  const platform = await findPlatformById(Number(req.params.id));
+  if (!platform) {
+    res.status(404).json({ error: 'unknown_connection' });
+    return;
+  }
+  if (platform.deployment_ids.length <= 1) {
+    res.status(409).json({
+      error: 'last_deployment',
+      message: 'A connection needs at least one deployment_id. Delete the whole connection instead.',
+    });
+    return;
+  }
+  const updated = await removeDeploymentId(platform.id, String(req.params.deploymentId));
+  res.json({ connection: connectionView(updated!) });
 });
 
 /**
- * Removes the lecture and, if the file was provider-hosted, the bytes with it.
- * A poster shared with another lecture is kept.
+ * Puts a deployment back behind the gate. The next launch must then be an
+ * Instructor again - useful when a course is handed to a new teacher, or to
+ * demonstrate the gate without recreating the connection.
  */
-adminRouter.delete('/content/lectures/:id', async (req, res) => {
-  const removed = await deleteLecture(String(req.params.id));
-  if (!removed) {
-    res.status(404).json({ error: 'unknown_lecture' });
+adminRouter.post('/connections/:id/reset-activation', async (req, res) => {
+  const deploymentId = String(req.body?.deploymentId ?? '').trim();
+  if (!deploymentId) {
+    res.status(400).json({ error: 'missing_deployment_id' });
+    return;
+  }
+  const platform = await clearActivation(Number(req.params.id), deploymentId);
+  if (!platform) {
+    res.status(404).json({ error: 'unknown_connection' });
+    return;
+  }
+  console.log(`[admin] activation reset for deployment ${deploymentId} on platform ${platform.id}`);
+  res.json({ connection: connectionView(platform) });
+});
+
+/** Suspends or resumes a connection without losing its activation history. */
+adminRouter.patch('/connections/:id', async (req, res) => {
+  const isActive = Boolean(req.body?.isActive);
+  const platform = await setPlatformActive(Number(req.params.id), isActive);
+  if (!platform) {
+    res.status(404).json({ error: 'unknown_connection' });
+    return;
+  }
+  res.json({ connection: connectionView(platform) });
+});
+
+/** Re-checks that the platform still publishes a readable key set. */
+adminRouter.post('/connections/:id/test', async (req, res) => {
+  const platform = await findPlatformById(Number(req.params.id));
+  if (!platform) {
+    res.status(404).json({ error: 'unknown_connection' });
+    return;
+  }
+  res.json({ jwks: await probeJwks(platform.jwks_url) });
+});
+
+adminRouter.delete('/connections/:id', async (req, res) => {
+  const platformId = Number(req.params.id);
+
+  /**
+   * Launches reference the connection they arrived through, and that history is
+   * the activity log this whole tool exists to produce. Deleting the connection
+   * would either destroy it or fail on the foreign key, so a connection that has
+   * ever been used is suspended instead - which already refuses new launches.
+   */
+  const [used] = await query<{ launches: string }>(
+    `SELECT count(*) AS launches FROM lti_launches WHERE platform_id = $1`,
+    [platformId],
+  );
+  if (Number(used?.launches ?? 0) > 0) {
+    res.status(409).json({
+      error: 'connection_in_use',
+      message:
+        `This connection has ${used!.launches} recorded launch(es), which the activity log still refers to. ` +
+        `Suspend it instead - that refuses every new launch and keeps the history.`,
+    });
     return;
   }
 
-  const stillUsed = async (path: string | null) =>
-    !path ? true : (await query(`SELECT 1 FROM lectures WHERE content_url = $1 OR poster_url = $1`, [path])).length > 0;
-
-  if (!(await stillUsed(removed.content_url))) await deleteMediaFile(removed.content_url);
-  if (!(await stillUsed(removed.poster_url))) await deleteMediaFile(removed.poster_url);
-
-  console.log(`[admin] deleted lecture ${removed.id}`);
+  const removed = await deletePlatform(platformId);
+  if (!removed) {
+    res.status(404).json({ error: 'unknown_connection' });
+    return;
+  }
+  console.log(`[admin] connection ${removed.id} deleted`);
   res.json({ ok: true, id: removed.id });
 });
+

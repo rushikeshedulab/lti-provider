@@ -116,10 +116,11 @@ export function safeMediaName(originalName: string, extension: string): string {
  * failed upload is removed, so the directory only ever holds complete objects.
  */
 export async function saveUploadStream(req: Request, filename: string): Promise<{ path: string; bytes: number }> {
-  const maxBytes = env.maxUploadMb * 1024 * 1024;
+  const maxBytes = env.mediaMaxUploadBytes;
+  const maxMb = Math.round(maxBytes / 1024 / 1024);
   const declared = Number(req.get('content-length') ?? 0);
   if (declared && declared > maxBytes) {
-    throw new UploadError('file_too_large', `File is larger than the ${env.maxUploadMb} MB limit.`, 413);
+    throw new UploadError('file_too_large', `File is larger than the ${maxMb} MB limit.`, 413);
   }
 
   const destination = join(MEDIA_DIR, filename);
@@ -134,7 +135,7 @@ export async function saveUploadStream(req: Request, filename: string): Promise<
           bytes += (chunk as Buffer).length;
           if (bytes > maxBytes) {
             overflowed = true;
-            throw new UploadError('file_too_large', `File is larger than the ${env.maxUploadMb} MB limit.`, 413);
+            throw new UploadError('file_too_large', `File is larger than the ${maxMb} MB limit.`, 413);
           }
           yield chunk;
         }

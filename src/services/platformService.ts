@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { SignJWT } from 'jose';
 import { env } from '../config/env.js';
 import { getPrivateKey, SIGNING_ALG } from '../lti/keys.js';
-import { findPlatform, type PlatformRegistration } from '../lti/platformStore.js';
+import { findPlatform, markActivationReported, type PlatformRegistration } from '../lti/platformStore.js';
 import { getLaunch } from './launchStore.js';
 import type { ViewingSessionRow } from './viewingSession.js';
 
@@ -20,6 +20,7 @@ import type { ViewingSessionRow } from './viewingSession.js';
  * the token endpoint works end to end.
  */
 export const VIEWING_SUMMARY_SCOPE = 'https://edulab.example/lti/scope/viewing.report';
+export const CONNECTION_SCOPE = 'https://edulab.example/lti/scope/connection.report';
 
 interface CachedToken {
   accessToken: string;
@@ -103,4 +104,37 @@ export async function reportViewingSummary(session: ViewingSessionRow): Promise<
     throw new Error(`viewing-summary returned ${response.status}`);
   }
   console.log(`[service-call] pushed viewing summary for session ${session.id} to ${platform.issuer}`);
+}
+
+/**
+ * Tells the platform that an instructor has completed the setup launch, so its
+ * own screens can stop saying "waiting for your instructor" and let students
+ * through. The tool's gate does not depend on this call succeeding - it is the
+ * platform's copy of a decision this side has already made and stored.
+ */
+export async function reportDeploymentActivated(
+  platform: PlatformRegistration,
+  deploymentId: string,
+  by: { userId: string; email?: string | null; name?: string | null; contextId?: string | null },
+): Promise<void> {
+  const accessToken = await getAccessToken(platform, CONNECTION_SCOPE);
+
+  const response = await fetch(`${platform.issuer}/lti/services/deployment-activated`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${accessToken}` },
+    body: JSON.stringify({
+      clientId: platform.client_id,
+      deploymentId,
+      activatedAt: new Date().toISOString(),
+      activatedBy: { userId: by.userId, email: by.email ?? null, name: by.name ?? null },
+      contextId: by.contextId ?? null,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`deployment-activated returned ${response.status}`);
+  }
+
+  await markActivationReported(platform.id, deploymentId);
+  console.log(`[service-call] told ${platform.issuer} that deployment ${deploymentId} is live`);
 }
