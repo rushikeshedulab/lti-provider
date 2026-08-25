@@ -11,13 +11,17 @@ import {
   type DeepLinkingSettingsClaim,
   type ResourceLinkClaim,
 } from '../lti/claims.js';
-import { findPlatform, isDeploymentActivated, recordActivation } from '../lti/platformStore.js';
+import {
+  findPlatform,
+  findPlatformByClientId,
+  isDeploymentActivated,
+  recordActivation,
+} from '../lti/platformStore.js';
 import { createState } from '../lti/stateStore.js';
 import { LtiValidationError, validateLaunch } from '../lti/validateLaunch.js';
 import { getLecture } from '../content/repository.js';
 import { ACTIVITY_EVENT, logActivity } from '../services/activityLog.js';
 import { createLaunchToken, recordLaunch } from '../services/launchStore.js';
-import { reportDeploymentActivated } from '../services/platformService.js';
 import { clientIp, renderErrorPage } from '../utils/http.js';
 
 export const ltiRouter = Router();
@@ -56,12 +60,39 @@ async function handleLoginInitiation(req: Request, res: Response) {
   }
 
   const platform = await findPlatform(iss, client_id ?? null);
+
+  /**
+   * The commonest way a hand-entered connection fails is an issuer that does
+   * not match to the character - a trailing slash, http vs https, or a host
+   * that differs from the address the administrator typed. The client_id is
+   * unique, so when it alone matches we can say exactly what is wrong instead
+   * of "unregistered platform".
+   */
+  if (!platform && client_id) {
+    const byClientId = await findPlatformByClientId(client_id);
+    if (byClientId) {
+      console.warn(
+        `[lti] issuer mismatch for client_id ${client_id}: launch says "${iss}", registration says "${byClientId.issuer}"`,
+      );
+      return renderErrorPage(
+        res,
+        401,
+        'This connection has the wrong issuer saved',
+        `The LMS identifies itself as "${iss}", but this connection stores "${byClientId.issuer}". ` +
+          `Open Admin - LTI connections and set the issuer to "${iss}" exactly.`,
+        'issuer_mismatch',
+      );
+    }
+  }
+
   if (!platform) {
     return renderErrorPage(
       res,
       401,
       'Unregistered platform',
-      `This tool has no active registration for issuer "${iss}"${client_id ? ` and client_id "${client_id}"` : ''}.`,
+      `This tool has no active registration for issuer "${iss}"${client_id ? ` and client_id "${client_id}"` : ''}. ` +
+        `Add it in Admin - LTI connections, using the client_id and deployment_id this LMS generated.`,
+      'unknown_platform',
     );
   }
 
@@ -70,7 +101,9 @@ async function handleLoginInitiation(req: Request, res: Response) {
       res,
       401,
       'Unknown deployment',
-      `deployment_id "${lti_deployment_id}" is not registered for this platform.`,
+      `The LMS launched with deployment_id "${lti_deployment_id}", but this connection knows only ` +
+        `${platform.deployment_ids.map((d) => `"${d}"`).join(', ')}. Add it in Admin - LTI connections.`,
+      'unknown_deployment',
     );
   }
 
@@ -140,49 +173,14 @@ ltiRouter.post('/launch', async (req: Request, res: Response) => {
   const toolPlatform = claims[CLAIM.TOOL_PLATFORM] as { name?: string; guid?: string } | undefined;
 
   // -------------------------------------------------------------------------
-  // THE INSTRUCTOR-FIRST GATE
+  // FIRST USE OF A DEPLOYMENT
   //
-  // A signature check proves the id_token came from a platform we trust. It
-  // does NOT prove that the deployment_id an administrator pasted in belongs to
-  // the course the students are sitting in - only somebody who can see both
-  // sides can confirm that, and that person is the instructor.
-  //
-  // So the first launch on a deployment must be an Instructor or Administrator.
-  // Their launch records the activation; every student launch after it passes
-  // straight through. Students arriving before it are told to wait, rather than
-  // being shown content that may be wired to the wrong course.
+  // No approval step: a launch that passed validation is served, whoever sent
+  // it. The first one seen on a deployment is recorded anyway, so the admin
+  // panel can show that a connection is genuinely working rather than merely
+  // saved. Recording never blocks the launch.
   // -------------------------------------------------------------------------
-  const instructorLaunch = isInstructorOrAdmin(claims);
-  const activated = isDeploymentActivated(platform, deploymentId);
-
-  if (!activated && !instructorLaunch) {
-    console.warn(
-      `[lti] launch held: deployment ${deploymentId} on ${platform.issuer} has not been set up by an instructor`,
-    );
-    await logActivity({
-      eventType: ACTIVITY_EVENT.LAUNCH_REJECTED,
-      userId: claims.sub,
-      userEmail: claims.email ?? null,
-      userName: claims.name ?? null,
-      platformIssuer: platform.issuer,
-      platformClientId: platform.client_id,
-      platformName: toolPlatform?.name ?? platform.name,
-      deploymentId,
-      ipAddress: ip,
-      userAgent,
-      metadata: { code: 'deployment_not_activated', roles },
-    });
-    return renderErrorPage(
-      res,
-      403,
-      'This content is not open yet',
-      'Your instructor has to open this connection once before the class can use it. ' +
-        'It becomes available to everyone as soon as they have done so.',
-      'deployment_not_activated',
-    );
-  }
-
-  if (instructorLaunch && !activated) {
+  if (!isDeploymentActivated(platform, deploymentId)) {
     await recordActivation({
       platformId: platform.id,
       deploymentId,
@@ -191,14 +189,13 @@ ltiRouter.post('/launch', async (req: Request, res: Response) => {
       name: claims.name ?? null,
       contextId: context?.id ?? null,
       contextTitle: context?.title ?? null,
-    });
+    }).catch((err: Error) => console.warn(`[lti] could not record first use: ${err.message}`));
+
     checks.push({
-      step: 'Deployment activation',
-      detail: `first instructor launch - deployment_id=${deploymentId} is now open to students`,
+      step: 'Deployment',
+      detail: `first launch seen for deployment_id=${deploymentId}`,
     });
-    console.log(
-      `[lti] deployment ${deploymentId} on ${platform.issuer} activated by ${claims.email ?? claims.sub}`,
-    );
+    console.log(`[lti] first launch on deployment ${deploymentId} from ${platform.issuer}`);
 
     await logActivity({
       eventType: ACTIVITY_EVENT.DEPLOYMENT_ACTIVATED,
@@ -213,16 +210,6 @@ ltiRouter.post('/launch', async (req: Request, res: Response) => {
       userAgent,
       metadata: { roles, context_id: context?.id ?? null, context_title: context?.title ?? null },
     });
-
-    // Tell the platform its connection is live, so its own UI can stop showing
-    // "waiting for setup". Best-effort: a platform without the service endpoint
-    // is not a reason to fail the instructor's launch.
-    void reportDeploymentActivated(platform, deploymentId, {
-      userId: claims.sub,
-      email: claims.email ?? null,
-      name: claims.name ?? null,
-      contextId: context?.id ?? null,
-    }).catch((err: Error) => console.warn(`[lti] could not report activation: ${err.message}`));
   }
 
   // -------------------------------------------------------------------------

@@ -9,10 +9,13 @@ import { api, formatTime } from '../lib/api';
  * authorization and token endpoints, the key set - is read from the LMS itself,
  * so nothing here requires an environment change or a restart.
  *
- * A saved connection is not usable yet. It stays 'pending' until an instructor
- * completes one launch through it, which is the only step that can confirm the
- * deployment really points at the right course. The gate itself lives in the
- * launch endpoint; this screen only shows its state.
+ * A saved connection is usable straight away - there is no approval step. The
+ * status simply reports whether a launch has actually arrived through it, which
+ * is how you tell a working connection from one that merely saved cleanly.
+ *
+ * When a launch misbehaves, "Test" checks the endpoints against the live
+ * platform and says whether the fault is this configuration or the platform
+ * asking its own user to sign in.
  */
 
 interface Deployment {
@@ -22,7 +25,6 @@ interface Deployment {
   activatedBy: string | null;
   activatedByEmail: string | null;
   contextTitle: string | null;
-  reportedToPlatform: boolean;
 }
 
 interface Connection {
@@ -50,6 +52,21 @@ interface ToolDocument {
   public_jwk_url?: string;
   key_id?: string;
   [key: string]: unknown;
+}
+
+interface EndpointReport {
+  url: string;
+  ok: boolean;
+  status: number | null;
+  detail: string;
+}
+
+interface Diagnosis {
+  jwks: { ok: boolean; keys: number; error?: string };
+  authorization: EndpointReport;
+  token: EndpointReport;
+  issuerMismatch: { saved: string; published: string } | null;
+  notes: string[];
 }
 
 interface Discovered {
@@ -114,6 +131,8 @@ export default function Connections({ token }: { token: string }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [ignoreJwksCheck, setIgnoreJwksCheck] = useState(false);
   const [newDeployment, setNewDeployment] = useState<Record<number, string>>({});
+  const [diagnosis, setDiagnosis] = useState<Record<number, Diagnosis>>({});
+  const [editing, setEditing] = useState<Record<number, Partial<Connection>>>({});
 
   const authed = useCallback(
     <T,>(path: string, options: RequestInit = {}) =>
@@ -182,7 +201,7 @@ export default function Connections({ token }: { token: string }) {
       setDiscovered(null);
       setShowAdvanced(false);
       setIgnoreJwksCheck(false);
-      setNotice('Connection saved. It opens to students once an instructor has launched it once.');
+      setNotice('Connection saved. Launch it from the LMS to confirm it works end to end.');
       await load();
     } catch (e) {
       setError((e as Error).message);
@@ -205,8 +224,8 @@ export default function Connections({ token }: { token: string }) {
 
   const statusBadge = (connection: Connection) => {
     if (!connection.isActive) return <span className="badge bad">suspended</span>;
-    if (connection.status === 'active') return <span className="badge good">connected</span>;
-    return <span className="badge warn">waiting for instructor</span>;
+    if (connection.status === 'active') return <span className="badge good">launching</span>;
+    return <span className="badge">no launch yet</span>;
   };
 
   return (
@@ -395,19 +414,27 @@ export default function Connections({ token }: { token: string }) {
                   className="secondary small"
                   onClick={() =>
                     act(async () => {
-                      const result = await authed<{ jwks: { ok: boolean; keys: number; error?: string } }>(
+                      const result = await authed<{ diagnosis: Diagnosis }>(
                         `/api/admin/connections/${connection.id}/test`,
                         { method: 'POST' },
                       );
-                      setNotice(
-                        result.jwks.ok
-                          ? `${connection.name} published ${result.jwks.keys} signing key(s).`
-                          : (result.jwks.error ?? 'Key set unreadable.'),
-                      );
+                      setDiagnosis((d) => ({ ...d, [connection.id]: result.diagnosis }));
                     })
                   }
                 >
                   Test
+                </button>
+                <button
+                  className="secondary small"
+                  onClick={() =>
+                    setEditing((e) =>
+                      connection.id in e
+                        ? Object.fromEntries(Object.entries(e).filter(([k]) => Number(k) !== connection.id))
+                        : { ...e, [connection.id]: { ...connection } },
+                    )
+                  }
+                >
+                  {connection.id in editing ? 'Cancel' : 'Edit endpoints'}
                 </button>
                 <button
                   className="secondary small"
@@ -446,16 +473,95 @@ export default function Connections({ token }: { token: string }) {
               </div>
             </div>
 
-            <dl className="kv" style={{ marginBottom: 10 }}>
-              <dt>client_id</dt>
-              <dd className="mono">{connection.clientId}</dd>
-              <dt>Authorization</dt>
-              <dd className="mono small">{connection.authLoginUrl}</dd>
-              <dt>Token</dt>
-              <dd className="mono small">{connection.authTokenUrl}</dd>
-              <dt>JWKS</dt>
-              <dd className="mono small">{connection.jwksUrl}</dd>
-            </dl>
+            {connection.id in editing ? (
+              <div style={{ marginBottom: 12 }}>
+                <p className="muted small">
+                  Correct these to match what the LMS actually publishes. The issuer must equal the{' '}
+                  <span className="mono">iss</span> it sends, character for character.
+                </p>
+                {(
+                  [
+                    ['issuer', 'Issuer (iss)'],
+                    ['authLoginUrl', 'Authorization endpoint'],
+                    ['authTokenUrl', 'Token endpoint'],
+                    ['jwksUrl', 'JWKS URL'],
+                  ] as const
+                ).map(([field, label]) => (
+                  <div className="field" key={field}>
+                    <label htmlFor={`${field}-${connection.id}`}>{label}</label>
+                    <input
+                      id={`${field}-${connection.id}`}
+                      className="mono"
+                      value={String(editing[connection.id]?.[field] ?? '')}
+                      onChange={(e) =>
+                        setEditing((prev) => ({
+                          ...prev,
+                          [connection.id]: { ...prev[connection.id], [field]: e.target.value },
+                        }))
+                      }
+                    />
+                  </div>
+                ))}
+                <button
+                  className="small"
+                  onClick={() =>
+                    act(async () => {
+                      await authed(`/api/admin/connections/${connection.id}/endpoints`, {
+                        method: 'PATCH',
+                        body: JSON.stringify(editing[connection.id]),
+                      });
+                      setEditing((e) =>
+                        Object.fromEntries(Object.entries(e).filter(([k]) => Number(k) !== connection.id)),
+                      );
+                    }, 'Endpoints updated.')
+                  }
+                >
+                  Save endpoints
+                </button>
+              </div>
+            ) : (
+              <dl className="kv" style={{ marginBottom: 10 }}>
+                <dt>client_id</dt>
+                <dd className="mono">{connection.clientId}</dd>
+                <dt>Authorization</dt>
+                <dd className="mono small">{connection.authLoginUrl}</dd>
+                <dt>Token</dt>
+                <dd className="mono small">{connection.authTokenUrl}</dd>
+                <dt>JWKS</dt>
+                <dd className="mono small">{connection.jwksUrl}</dd>
+              </dl>
+            )}
+
+            {diagnosis[connection.id] && (
+              <div
+                className={
+                  diagnosis[connection.id]!.issuerMismatch ||
+                  !diagnosis[connection.id]!.jwks.ok ||
+                  !diagnosis[connection.id]!.authorization.ok
+                    ? 'notice bad'
+                    : 'notice good'
+                }
+                style={{ marginBottom: 10 }}
+              >
+                <div style={{ marginBottom: 6 }}>
+                  <strong>Key set</strong>{' '}
+                  {diagnosis[connection.id]!.jwks.ok
+                    ? `${diagnosis[connection.id]!.jwks.keys} signing key(s)`
+                    : (diagnosis[connection.id]!.jwks.error ?? 'unreadable')}
+                </div>
+                <div style={{ marginBottom: 6 }}>
+                  <strong>Authorization endpoint</strong> {diagnosis[connection.id]!.authorization.detail}
+                </div>
+                <div style={{ marginBottom: 6 }}>
+                  <strong>Token endpoint</strong> {diagnosis[connection.id]!.token.detail}
+                </div>
+                {diagnosis[connection.id]!.notes.map((note) => (
+                  <div className="small" key={note} style={{ marginTop: 4 }}>
+                    {note}
+                  </div>
+                ))}
+              </div>
+            )}
 
             <div className="table-wrap">
               <table>
@@ -463,7 +569,7 @@ export default function Connections({ token }: { token: string }) {
                   <tr>
                     <th>deployment_id</th>
                     <th>Status</th>
-                    <th>Opened by</th>
+                    <th>First launch</th>
                     <th>Course</th>
                     <th />
                   </tr>
@@ -474,15 +580,15 @@ export default function Connections({ token }: { token: string }) {
                       <td className="mono small">{deployment.deploymentId}</td>
                       <td>
                         {deployment.activated ? (
-                          <span className="badge good">open to students</span>
+                          <span className="badge good">in use</span>
                         ) : (
-                          <span className="badge warn">instructor must launch</span>
+                          <span className="badge">not launched yet</span>
                         )}
                       </td>
                       <td className="small">
                         {deployment.activated ? (
                           <>
-                            {deployment.activatedBy ?? 'an instructor'}
+                            {deployment.activatedBy ?? 'unknown user'}
                             <br />
                             <span className="muted">{formatTime(deployment.activatedAt)}</span>
                           </>
@@ -496,7 +602,7 @@ export default function Connections({ token }: { token: string }) {
                           {deployment.activated && (
                             <button
                               className="secondary small"
-                              title="Require an instructor launch again"
+                              title="Forget the first-launch record"
                               onClick={() =>
                                 act(
                                   () =>
@@ -504,7 +610,7 @@ export default function Connections({ token }: { token: string }) {
                                       method: 'POST',
                                       body: JSON.stringify({ deploymentId: deployment.deploymentId }),
                                     }),
-                                  'Deployment closed again until an instructor launches it.',
+                                  'First-launch record cleared.',
                                 )
                               }
                             >

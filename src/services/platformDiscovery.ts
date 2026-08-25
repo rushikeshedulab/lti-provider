@@ -106,16 +106,64 @@ function absolute(value: string | null, baseUrl: string): string | null {
   }
 }
 
-function conventionalDefaults(baseUrl: string): Omit<DiscoveredPlatform, 'source' | 'warning'> {
+/**
+ * Endpoint layouts seen in the wild. Plenty of platforms publish no discovery
+ * document at all, so when none is found we probe these against the address
+ * instead of emitting one fixed guess - a guess is wrong for every LMS that
+ * does not happen to share this project's own paths.
+ *
+ * Ordered by how strongly a match identifies the platform. The three paths in a
+ * family belong together: a token endpoint almost never answers a GET, so it is
+ * taken from whichever family its siblings matched rather than probed.
+ */
+const ENDPOINT_FAMILIES = [
+  { name: 'lti/auth', auth: '/lti/auth', token: '/lti/token', jwks: '/lti/jwks' },
+  { name: 'lti/authorize', auth: '/lti/authorize', token: '/lti/token', jwks: '/.well-known/jwks.json' },
+  { name: 'moodle', auth: '/mod/lti/auth.php', token: '/mod/lti/token.php', jwks: '/mod/lti/certs.php' },
+  {
+    name: 'canvas',
+    auth: '/api/lti/authorize_redirect',
+    token: '/login/oauth2/token',
+    jwks: '/api/lti/security/jwks',
+  },
+] as const;
+
+function familyToDiscovered(
+  baseUrl: string,
+  family: (typeof ENDPOINT_FAMILIES)[number],
+): Omit<DiscoveredPlatform, 'source' | 'warning'> {
   return {
     name: null,
     issuer: baseUrl,
-    authLoginUrl: `${baseUrl}/lti/authorize`,
-    authTokenUrl: `${baseUrl}/lti/token`,
-    jwksUrl: `${baseUrl}/.well-known/jwks.json`,
+    authLoginUrl: `${baseUrl}${family.auth}`,
+    authTokenUrl: `${baseUrl}${family.token}`,
+    jwksUrl: `${baseUrl}${family.jwks}`,
     suggestedClientId: null,
     suggestedDeploymentId: null,
   };
+}
+
+function conventionalDefaults(baseUrl: string): Omit<DiscoveredPlatform, 'source' | 'warning'> {
+  return familyToDiscovered(baseUrl, ENDPOINT_FAMILIES[1]);
+}
+
+/**
+ * Does something answer here? A 404 or 405 means the path is wrong; anything
+ * else - including the 400 an authorization endpoint returns when handed no
+ * OIDC parameters, and the redirect it returns when there is no session - means
+ * the endpoint is really there.
+ */
+async function endpointExists(url: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { method: 'GET', redirect: 'manual', signal: controller.signal });
+    return response.status !== 404 && response.status !== 405 && response.status < 500;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function discoverPlatform(rawUrl: string): Promise<DiscoveredPlatform> {
@@ -126,18 +174,31 @@ export async function discoverPlatform(rawUrl: string): Promise<DiscoveredPlatfo
     if (found) return found;
   }
 
-  // Nothing published a discovery document. Guess the conventional paths, and
-  // prefer whichever candidate actually serves a key set, so a scheme-less
-  // address still lands on the scheme the LMS really uses.
+  // No discovery document anywhere. Find the endpoints by probing instead.
   for (const candidate of candidates) {
-    const defaults = conventionalDefaults(candidate);
-    if ((await probeJwks(defaults.jwksUrl)).ok) {
+    const scored = await Promise.all(
+      ENDPOINT_FAMILIES.map(async (family) => {
+        const [jwks, authOk] = await Promise.all([
+          probeJwks(`${candidate}${family.jwks}`),
+          endpointExists(`${candidate}${family.auth}`),
+        ]);
+        // A readable key set is the strongest signal - it is unambiguous JSON
+        // in a known shape, where an authorization endpoint only proves that
+        // *something* is served at the path.
+        return { family, score: (jwks.ok ? 2 : 0) + (authOk ? 1 : 0), keys: jwks.keys };
+      }),
+    );
+
+    const best = scored.sort((a, b) => b.score - a.score)[0]!;
+    if (best.score >= 2) {
       return {
-        ...defaults,
-        source: 'defaults',
+        ...familyToDiscovered(candidate, best.family),
+        source: `probed (${best.family.name})`,
         warning:
-          `No discovery document was published at ${candidate}, but it does serve a key set at the conventional ` +
-          `path. Check the endpoints below against the LMS before saving.`,
+          best.score === 3
+            ? null
+            : `No discovery document was published at ${candidate}. These paths were found by probing - ` +
+              `check them against the LMS before saving.`,
       };
     }
   }
@@ -147,8 +208,8 @@ export async function discoverPlatform(rawUrl: string): Promise<DiscoveredPlatfo
     ...conventionalDefaults(baseUrl),
     source: 'defaults',
     warning:
-      `No discovery document was published at ${baseUrl}. The conventional endpoint paths are filled in below - ` +
-      `check them against the LMS before saving.`,
+      `Nothing was discoverable at ${baseUrl} - no config document, and no endpoints found by probing. ` +
+      `The paths below are a guess; fill in the real ones from the LMS before saving.`,
   };
 }
 
@@ -209,6 +270,102 @@ async function discoverAt(baseUrl: string): Promise<DiscoveredPlatform | null> {
   }
 
   return null;
+}
+
+export interface EndpointReport {
+  url: string;
+  ok: boolean;
+  status: number | null;
+  detail: string;
+}
+
+export interface Diagnosis {
+  jwks: { ok: boolean; keys: number; error?: string };
+  authorization: EndpointReport;
+  token: EndpointReport;
+  /** Set when the platform's own config disagrees with what was saved. */
+  issuerMismatch: { saved: string; published: string } | null;
+  notes: string[];
+}
+
+/** Reaches an endpoint just far enough to tell "wrong URL" from "works". */
+async function probeEndpoint(url: string): Promise<EndpointReport> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    // `redirect: manual` matters: an authorization endpoint answering a
+    // session-less request with a redirect to its own login page is normal, and
+    // following it would hide the fact that the endpoint exists at all.
+    const response = await fetch(url, { method: 'GET', redirect: 'manual', signal: controller.signal });
+    const status = response.status;
+
+    if (status === 404 || status === 405) {
+      return { url, ok: false, status, detail: `Nothing is served here (HTTP ${status}). The path is wrong.` };
+    }
+    if (status >= 500) {
+      return { url, ok: false, status, detail: `The platform returned HTTP ${status}.` };
+    }
+    if (status >= 300 && status < 400) {
+      return {
+        url,
+        ok: true,
+        status,
+        detail:
+          `Answers, and redirects a request with no session - normal for an authorization endpoint. ` +
+          `If a user sees a login page during a launch, that redirect is the platform asking them to sign in.`,
+      };
+    }
+    return { url, ok: true, status, detail: `Answers with HTTP ${status}.` };
+  } catch (err) {
+    return { url, ok: false, status: null, detail: `Unreachable: ${(err as Error).message}` };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Checks a saved connection against the platform as it is right now. The point
+ * is to separate "this tool is pointed at the wrong URL", which is fixable
+ * here, from "the platform wants the user to sign in", which is not.
+ */
+export async function diagnoseConnection(input: {
+  issuer: string;
+  authLoginUrl: string;
+  authTokenUrl: string;
+  jwksUrl: string;
+}): Promise<Diagnosis> {
+  const [jwks, authorization, token] = await Promise.all([
+    probeJwks(input.jwksUrl),
+    probeEndpoint(input.authLoginUrl),
+    probeEndpoint(input.authTokenUrl),
+  ]);
+
+  const notes: string[] = [];
+  let issuerMismatch: Diagnosis['issuerMismatch'] = null;
+
+  // The `iss` a platform sends at login initiation must equal what is saved
+  // here, character for character, or no registration will be found.
+  const published = await discoverAt(input.issuer).catch(() => null);
+  if (published && published.issuer !== input.issuer) {
+    issuerMismatch = { saved: input.issuer, published: published.issuer };
+    notes.push(
+      `This platform publishes its issuer as "${published.issuer}" but the connection stores "${input.issuer}". ` +
+        `Launches will be refused as "unregistered platform" until they match.`,
+    );
+  }
+
+  if (!jwks.ok) notes.push(`Launch signatures cannot be verified: ${jwks.error}`);
+  if (!authorization.ok) notes.push(`The authorization endpoint looks wrong: ${authorization.detail}`);
+  if (!token.ok) notes.push(`The token endpoint looks wrong: ${token.detail}`);
+
+  if (!notes.length) {
+    notes.push(
+      'Every endpoint answers and the key set is readable. A sign-in prompt during a launch is then the ' +
+        'platform authenticating its own user, which this tool cannot and should not suppress.',
+    );
+  }
+
+  return { jwks, authorization, token, issuerMismatch, notes };
 }
 
 /**
