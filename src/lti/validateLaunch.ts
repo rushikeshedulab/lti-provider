@@ -1,8 +1,10 @@
-import { createRemoteJWKSet, decodeJwt, jwtVerify, type JWTVerifyGetKey } from 'jose';
+import { decodeJwt, jwtVerify } from 'jose';
 import { env, toolEndpoints } from '../config/env.js';
 import { CLAIM, LTI_VERSION, MESSAGE_TYPE, type LtiIdTokenClaims } from './claims.js';
 import { findPlatform, type PlatformRegistration } from './platformStore.js';
 import { consumeNonce, consumeState, type OidcStateRow } from './stateStore.js';
+import { jwksFor } from './jwks.js';
+import { resolvePlatformEndpoints } from '../services/platformEndpoints.js';
 
 export class LtiValidationError extends Error {
   constructor(
@@ -12,17 +14,6 @@ export class LtiValidationError extends Error {
     super(message);
     this.name = 'LtiValidationError';
   }
-}
-
-/** One remote JWKS per platform, cached by jose (respects Cache-Control, refetches on unknown kid). */
-const jwksCache = new Map<string, JWTVerifyGetKey>();
-function jwksFor(url: string): JWTVerifyGetKey {
-  let set = jwksCache.get(url);
-  if (!set) {
-    set = createRemoteJWKSet(new URL(url), { cacheMaxAge: 5 * 60_000, cooldownDuration: 5_000 });
-    jwksCache.set(url, set);
-  }
-  return set;
 }
 
 export interface ValidatedLaunch {
@@ -99,9 +90,12 @@ export async function validateLaunch(input: {
   }
 
   // --- 4. Signature, issuer, audience, expiry ----------------------------
+  // The key set is resolved, not read straight off the row: if the platform has
+  // moved its JWKS and published the move, we follow it. Never blocks.
+  const endpoints = await resolvePlatformEndpoints(platform);
   let claims: LtiIdTokenClaims;
   try {
-    const verified = await jwtVerify(input.idToken, jwksFor(platform.jwks_url), {
+    const verified = await jwtVerify(input.idToken, jwksFor(platform.id, endpoints.jwksUrl), {
       issuer: platform.issuer,
       audience: platform.client_id,
       algorithms: ['RS256'],
@@ -111,7 +105,7 @@ export async function validateLaunch(input: {
     claims = verified.payload as LtiIdTokenClaims;
     checks.push({
       step: 'Signature verification',
-      detail: `RS256 verified against ${platform.jwks_url} (kid=${verified.protectedHeader.kid ?? 'n/a'})`,
+      detail: `RS256 verified against ${endpoints.jwksUrl} (kid=${verified.protectedHeader.kid ?? 'n/a'})`,
     });
   } catch (err) {
     throw new LtiValidationError('invalid_signature', `id_token verification failed: ${(err as Error).message}`);

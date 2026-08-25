@@ -1,3 +1,22 @@
+/**
+ * An error that kept the response body.
+ *
+ * Endpoint validation reports which FIELD is wrong and why, and a plain Error
+ * would throw all of that away and leave the form showing one flat sentence.
+ * Existing `catch (e) { setError((e as Error).message) }` call sites are
+ * unaffected - the message is still the message.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly code: string | null,
+    public readonly body: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
     ...options,
@@ -6,7 +25,11 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   const text = await response.text();
   const body = text ? JSON.parse(text) : {};
   if (!response.ok) {
-    throw new Error(body.message ?? body.error ?? `Request failed (${response.status})`);
+    throw new ApiError(
+      body.message ?? body.error ?? `Request failed (${response.status})`,
+      body.error ?? null,
+      body,
+    );
   }
   return body as T;
 }

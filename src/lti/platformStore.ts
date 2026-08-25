@@ -6,8 +6,17 @@ export interface PlatformRegistration {
   issuer: string;
   client_id: string;
   deployment_ids: string[];
+  /**
+   * The last endpoints that VALIDATED, not the ones an administrator typed once.
+   * When `discovery_url` is set these are rewritten by the background refresh in
+   * services/platformEndpoints.ts, so a platform that moves an endpoint is
+   * followed without anyone editing the connection. Read them through
+   * resolvePlatformEndpoints(), never directly, on any path that performs a
+   * launch or a service call.
+   */
   auth_login_url: string;
-  auth_token_url: string;
+  /** Null when the platform publishes no token endpoint (no LTI Advantage services). */
+  auth_token_url: string | null;
   jwks_url: string;
   tool_redirect_uri: string;
   is_active: boolean;
@@ -15,6 +24,11 @@ export interface PlatformRegistration {
   status: string;
   notes: string | null;
   activated_deployments: ActivationMap;
+  /** The document the endpoints came from. Null means they were entered by hand. */
+  discovery_url: string | null;
+  discovery_source: string | null;
+  discovery_fetched_at: string | null;
+  discovery_error: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -97,17 +111,27 @@ export async function upsertPlatform(reg: {
   clientId: string;
   deploymentIds: string[];
   authLoginUrl: string;
-  authTokenUrl: string;
+  authTokenUrl: string | null;
   jwksUrl: string;
   toolRedirectUri: string;
   createdVia?: string;
   notes?: string | null;
+  discoveryUrl?: string | null;
+  discoverySource?: string | null;
+  /**
+   * False stores the connection without serving launches through it - the
+   * honest home for "save this even though I cannot verify it", which used to
+   * be an "ignore the key check" flag that saved a broken connection as though
+   * it worked.
+   */
+  isActive?: boolean;
 }): Promise<PlatformRegistration> {
   const row = await queryOne<PlatformRegistration>(
     `INSERT INTO lti_platforms
        (name, issuer, client_id, deployment_ids, auth_login_url, auth_token_url, jwks_url, tool_redirect_uri,
-        created_via, notes)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        created_via, notes, discovery_url, discovery_source, discovery_fetched_at, is_active)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+             CASE WHEN $11::text IS NULL THEN NULL ELSE now() END, $13)
      ON CONFLICT (issuer, client_id) DO UPDATE SET
        name = EXCLUDED.name,
        -- Deployments are additive: saving the connection again must not orphan
@@ -121,7 +145,11 @@ export async function upsertPlatform(reg: {
        jwks_url = EXCLUDED.jwks_url,
        tool_redirect_uri = EXCLUDED.tool_redirect_uri,
        notes = EXCLUDED.notes,
-       is_active = TRUE,
+       discovery_url = EXCLUDED.discovery_url,
+       discovery_source = EXCLUDED.discovery_source,
+       discovery_fetched_at = EXCLUDED.discovery_fetched_at,
+       discovery_error = NULL,
+       is_active = EXCLUDED.is_active,
        updated_at = now()
      RETURNING *`,
     [
@@ -135,9 +163,59 @@ export async function upsertPlatform(reg: {
       reg.toolRedirectUri,
       reg.createdVia ?? 'env',
       reg.notes ?? null,
+      reg.discoveryUrl ?? null,
+      reg.discoverySource ?? null,
+      reg.isActive ?? true,
     ],
   );
   return row!;
+}
+
+/**
+ * Writes back endpoints re-read from the platform's discovery document.
+ *
+ * Deliberately NOT upsertPlatform: that also merges deployment_ids, rewrites
+ * notes and forces is_active back to TRUE. A background refresh must touch the
+ * endpoints and nothing else - resuming a connection an administrator suspended
+ * would be a surprising side effect of a timer firing.
+ */
+export function updateResolvedEndpoints(
+  platformId: number,
+  next: { authLoginUrl: string; authTokenUrl: string | null; jwksUrl: string; discoverySource: string },
+) {
+  return queryOne<PlatformRegistration>(
+    `UPDATE lti_platforms
+        SET auth_login_url = $2,
+            auth_token_url = $3,
+            jwks_url = $4,
+            discovery_source = $5,
+            discovery_fetched_at = now(),
+            discovery_error = NULL,
+            updated_at = now()
+      WHERE id = $1
+      RETURNING *`,
+    [platformId, next.authLoginUrl, next.authTokenUrl, next.jwksUrl, next.discoverySource],
+  );
+}
+
+/**
+ * Records why the last refresh did not produce usable endpoints. The stored
+ * endpoints are left exactly as they were - a platform being briefly unreachable
+ * must not cost a working connection its configuration.
+ */
+export async function recordDiscoveryFailure(platformId: number, detail: string): Promise<void> {
+  await query(`UPDATE lti_platforms SET discovery_error = $2, updated_at = now() WHERE id = $1`, [
+    platformId,
+    detail.slice(0, 500),
+  ]);
+}
+
+/** Marks a successful refresh that produced no change, so freshness is still tracked. */
+export async function touchDiscoveryFetchedAt(platformId: number, source: string): Promise<void> {
+  await query(
+    `UPDATE lti_platforms SET discovery_fetched_at = now(), discovery_source = $2, discovery_error = NULL WHERE id = $1`,
+    [platformId, source],
+  );
 }
 
 /** Adds one more deployment_id to an existing connection. */

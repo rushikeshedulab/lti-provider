@@ -1,8 +1,10 @@
 import { Router } from 'express';
-import { createRemoteJWKSet, decodeJwt, jwtVerify, type JWTVerifyGetKey } from 'jose';
+import { decodeJwt, jwtVerify } from 'jose';
 import { env, toolEndpoints } from '../config/env.js';
 import { getCourseCatalog } from '../content/repository.js';
 import { findPlatform } from '../lti/platformStore.js';
+import { jwksFor } from '../lti/jwks.js';
+import { resolvePlatformEndpoints } from '../services/platformEndpoints.js';
 
 /**
  * CATALOG SERVICE  (GET /api/catalog)
@@ -23,17 +25,6 @@ import { findPlatform } from '../lti/platformStore.js';
 export const catalogRouter = Router();
 
 export const CATALOG_AUDIENCE = `${env.baseUrl}/api/catalog`;
-
-/** One remote key set per platform JWKS URL - jose caches and rotates for us. */
-const jwksCache = new Map<string, JWTVerifyGetKey>();
-function jwksFor(url: string): JWTVerifyGetKey {
-  let jwks = jwksCache.get(url);
-  if (!jwks) {
-    jwks = createRemoteJWKSet(new URL(url));
-    jwksCache.set(url, jwks);
-  }
-  return jwks;
-}
 
 catalogRouter.get('/catalog', async (req, res) => {
   const header = req.get('authorization');
@@ -58,7 +49,8 @@ catalogRouter.get('/catalog', async (req, res) => {
   }
 
   try {
-    const { payload } = await jwtVerify(assertion, jwksFor(platform.jwks_url), {
+    const endpoints = await resolvePlatformEndpoints(platform);
+    const { payload } = await jwtVerify(assertion, jwksFor(platform.id, endpoints.jwksUrl), {
       issuer: platform.issuer,
       // Addressed to this exact endpoint, so it cannot be replayed elsewhere.
       audience: CATALOG_AUDIENCE,

@@ -5,6 +5,8 @@ import { getPrivateKey, SIGNING_ALG } from '../lti/keys.js';
 import { findPlatform, type PlatformRegistration } from '../lti/platformStore.js';
 import { getLaunch } from './launchStore.js';
 import type { ViewingSessionRow } from './viewingSession.js';
+import { resolvePlatformEndpoints } from './platformEndpoints.js';
+import { fetchWithTimeout } from './httpProbe.js';
 
 /**
  * LTI ADVANTAGE SERVICE CALLS (tool -> platform)
@@ -27,13 +29,13 @@ interface CachedToken {
 }
 const tokenCache = new Map<string, CachedToken>();
 
-async function buildClientAssertion(platform: PlatformRegistration): Promise<string> {
+async function buildClientAssertion(platform: PlatformRegistration, tokenUrl: string): Promise<string> {
   const key = await getPrivateKey();
   return new SignJWT({})
     .setProtectedHeader({ alg: SIGNING_ALG, kid: env.keyId, typ: 'JWT' })
     .setIssuer(platform.client_id) // the tool identifies itself by its client_id
     .setSubject(platform.client_id)
-    .setAudience(platform.auth_token_url)
+    .setAudience(tokenUrl)
     .setJti(randomUUID())
     .setIssuedAt()
     .setExpirationTime('60s')
@@ -41,11 +43,22 @@ async function buildClientAssertion(platform: PlatformRegistration): Promise<str
 }
 
 export async function getAccessToken(platform: PlatformRegistration, scope: string): Promise<string> {
-  const cacheKey = `${platform.id}:${scope}`;
+  const endpoints = await resolvePlatformEndpoints(platform);
+  const tokenUrl = endpoints.authTokenUrl;
+  if (!tokenUrl) {
+    throw new Error(
+      `Platform "${platform.issuer}" publishes no token endpoint, so LTI Advantage service calls are unavailable.`,
+    );
+  }
+
+  // The token URL is part of the key: the client assertion is addressed to it,
+  // so a token minted for the previous audience would be rejected outright if
+  // the platform moved its token endpoint.
+  const cacheKey = `${platform.id}:${tokenUrl}:${scope}`;
   const cached = tokenCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now() + 5_000) return cached.accessToken;
 
-  const assertion = await buildClientAssertion(platform);
+  const assertion = await buildClientAssertion(platform, tokenUrl);
   const body = new URLSearchParams({
     grant_type: 'client_credentials',
     client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
@@ -53,11 +66,13 @@ export async function getAccessToken(platform: PlatformRegistration, scope: stri
     scope,
   });
 
-  const response = await fetch(platform.auth_token_url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body,
-  });
+  // Timed: an unresponsive platform token endpoint used to hang this call - and
+  // the activity report behind it - indefinitely.
+  const response = await fetchWithTimeout(
+    tokenUrl,
+    { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body },
+    10_000,
+  );
 
   if (!response.ok) {
     throw new Error(`Token endpoint returned ${response.status}: ${await response.text()}`);
@@ -82,7 +97,7 @@ export async function reportViewingSummary(session: ViewingSessionRow): Promise<
 
   const accessToken = await getAccessToken(platform, VIEWING_SUMMARY_SCOPE);
 
-  const response = await fetch(`${platform.issuer}/lti/services/viewing-summary`, {
+  const response = await fetchWithTimeout(`${platform.issuer}/lti/services/viewing-summary`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${accessToken}` },
     body: JSON.stringify({
@@ -101,6 +116,17 @@ export async function reportViewingSummary(session: ViewingSessionRow): Promise<
 
   if (!response.ok) {
     throw new Error(`viewing-summary returned ${response.status}`);
+  }
+  // A 200 is not enough on its own. This path is not part of the LTI spec, so a
+  // platform that does not implement it answers with whatever its front-end
+  // serves for an unknown path - typically index.html at HTTP 200 - and we would
+  // log a successful push that pushed nothing.
+  const contentType = (response.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
+  if (contentType.startsWith('text/html')) {
+    throw new Error(
+      `viewing-summary answered HTTP ${response.status} with text/html - this platform does not implement ` +
+        `the viewing-summary service, its front-end is answering the path.`,
+    );
   }
   console.log(`[service-call] pushed viewing summary for session ${session.id} to ${platform.issuer}`);
 }
