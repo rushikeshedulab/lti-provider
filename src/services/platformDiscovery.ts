@@ -106,16 +106,64 @@ function absolute(value: string | null, baseUrl: string): string | null {
   }
 }
 
-function conventionalDefaults(baseUrl: string): Omit<DiscoveredPlatform, 'source' | 'warning'> {
+/**
+ * Endpoint layouts seen in the wild. Plenty of platforms publish no discovery
+ * document at all, so when none is found we probe these against the address
+ * instead of emitting one fixed guess - a guess is wrong for every LMS that
+ * does not happen to share this project's own paths.
+ *
+ * Ordered by how strongly a match identifies the platform. The three paths in a
+ * family belong together: a token endpoint almost never answers a GET, so it is
+ * taken from whichever family its siblings matched rather than probed.
+ */
+const ENDPOINT_FAMILIES = [
+  { name: 'lti/auth', auth: '/lti/auth', token: '/lti/token', jwks: '/lti/jwks' },
+  { name: 'lti/authorize', auth: '/lti/authorize', token: '/lti/token', jwks: '/.well-known/jwks.json' },
+  { name: 'moodle', auth: '/mod/lti/auth.php', token: '/mod/lti/token.php', jwks: '/mod/lti/certs.php' },
+  {
+    name: 'canvas',
+    auth: '/api/lti/authorize_redirect',
+    token: '/login/oauth2/token',
+    jwks: '/api/lti/security/jwks',
+  },
+] as const;
+
+function familyToDiscovered(
+  baseUrl: string,
+  family: (typeof ENDPOINT_FAMILIES)[number],
+): Omit<DiscoveredPlatform, 'source' | 'warning'> {
   return {
     name: null,
     issuer: baseUrl,
-    authLoginUrl: `${baseUrl}/lti/authorize`,
-    authTokenUrl: `${baseUrl}/lti/token`,
-    jwksUrl: `${baseUrl}/.well-known/jwks.json`,
+    authLoginUrl: `${baseUrl}${family.auth}`,
+    authTokenUrl: `${baseUrl}${family.token}`,
+    jwksUrl: `${baseUrl}${family.jwks}`,
     suggestedClientId: null,
     suggestedDeploymentId: null,
   };
+}
+
+function conventionalDefaults(baseUrl: string): Omit<DiscoveredPlatform, 'source' | 'warning'> {
+  return familyToDiscovered(baseUrl, ENDPOINT_FAMILIES[1]);
+}
+
+/**
+ * Does something answer here? A 404 or 405 means the path is wrong; anything
+ * else - including the 400 an authorization endpoint returns when handed no
+ * OIDC parameters, and the redirect it returns when there is no session - means
+ * the endpoint is really there.
+ */
+async function endpointExists(url: string): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { method: 'GET', redirect: 'manual', signal: controller.signal });
+    return response.status !== 404 && response.status !== 405 && response.status < 500;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function discoverPlatform(rawUrl: string): Promise<DiscoveredPlatform> {
@@ -126,18 +174,31 @@ export async function discoverPlatform(rawUrl: string): Promise<DiscoveredPlatfo
     if (found) return found;
   }
 
-  // Nothing published a discovery document. Guess the conventional paths, and
-  // prefer whichever candidate actually serves a key set, so a scheme-less
-  // address still lands on the scheme the LMS really uses.
+  // No discovery document anywhere. Find the endpoints by probing instead.
   for (const candidate of candidates) {
-    const defaults = conventionalDefaults(candidate);
-    if ((await probeJwks(defaults.jwksUrl)).ok) {
+    const scored = await Promise.all(
+      ENDPOINT_FAMILIES.map(async (family) => {
+        const [jwks, authOk] = await Promise.all([
+          probeJwks(`${candidate}${family.jwks}`),
+          endpointExists(`${candidate}${family.auth}`),
+        ]);
+        // A readable key set is the strongest signal - it is unambiguous JSON
+        // in a known shape, where an authorization endpoint only proves that
+        // *something* is served at the path.
+        return { family, score: (jwks.ok ? 2 : 0) + (authOk ? 1 : 0), keys: jwks.keys };
+      }),
+    );
+
+    const best = scored.sort((a, b) => b.score - a.score)[0]!;
+    if (best.score >= 2) {
       return {
-        ...defaults,
-        source: 'defaults',
+        ...familyToDiscovered(candidate, best.family),
+        source: `probed (${best.family.name})`,
         warning:
-          `No discovery document was published at ${candidate}, but it does serve a key set at the conventional ` +
-          `path. Check the endpoints below against the LMS before saving.`,
+          best.score === 3
+            ? null
+            : `No discovery document was published at ${candidate}. These paths were found by probing - ` +
+              `check them against the LMS before saving.`,
       };
     }
   }
@@ -147,8 +208,8 @@ export async function discoverPlatform(rawUrl: string): Promise<DiscoveredPlatfo
     ...conventionalDefaults(baseUrl),
     source: 'defaults',
     warning:
-      `No discovery document was published at ${baseUrl}. The conventional endpoint paths are filled in below - ` +
-      `check them against the LMS before saving.`,
+      `Nothing was discoverable at ${baseUrl} - no config document, and no endpoints found by probing. ` +
+      `The paths below are a guess; fill in the real ones from the LMS before saving.`,
   };
 }
 
