@@ -6,6 +6,7 @@ import { env, toolEndpoints } from './config/env.js';
 import { toolRegistrationDocument } from './config/registration.js';
 import { getPublicJwks } from './lti/keys.js';
 import { listPlatformOrigins } from './lti/platformStore.js';
+import { refreshAllPlatformEndpoints } from './services/platformEndpoints.js';
 import { verifyMediaToken } from './services/contentSession.js';
 import { MEDIA_DIR } from './content/uploads.js';
 import { renderErrorPage } from './utils/http.js';
@@ -169,6 +170,9 @@ await runStartupMigrations().catch((err: Error) => {
   console.error('[migrate] startup migration failed:', err.message);
 });
 await refreshFrameAncestors();
+// Warm the endpoint cache before the first launch arrives, so it is served from
+// a document read at boot rather than from a snapshot of unknown age.
+await refreshAllPlatformEndpoints();
 
 app.listen(env.port, () => {
   console.log('');
@@ -184,6 +188,10 @@ app.listen(env.port, () => {
   startReaper();
   // Picks up a platform connected from /admin without a restart.
   setInterval(() => void refreshFrameAncestors(), 60 * 1000).unref();
+  // Re-reads each connected platform's discovery document, so an LMS that moves
+  // an endpoint is followed without anyone editing a connection. Failures keep
+  // the last known-good values; nothing here can block a launch.
+  setInterval(() => void refreshAllPlatformEndpoints(), env.platformDiscoveryTtlSeconds * 1000).unref();
   purgeExpired().catch(() => {});
   setInterval(() => void purgeExpired().catch(() => {}), 15 * 60 * 1000).unref();
 });

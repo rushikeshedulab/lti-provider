@@ -18,6 +18,7 @@ import {
   recordActivation,
 } from '../lti/platformStore.js';
 import { createState } from '../lti/stateStore.js';
+import { resolvePlatformEndpoints } from '../services/platformEndpoints.js';
 import { LtiValidationError, validateLaunch } from '../lti/validateLaunch.js';
 import { getLecture } from '../content/repository.js';
 import { ACTIVITY_EVENT, logActivity } from '../services/activityLog.js';
@@ -118,7 +119,24 @@ async function handleLoginInitiation(req: Request, res: Response) {
 
   res.cookie(STATE_COOKIE, state, stateCookieOptions());
 
-  const authUrl = new URL(platform.auth_login_url);
+  // Resolved, not read straight off the row: when the platform publishes a
+  // discovery document its endpoints are re-read on a timer, so an endpoint that
+  // moves is followed without an administrator editing anything. This never waits
+  // on the network - see services/platformEndpoints.ts.
+  const endpoints = await resolvePlatformEndpoints(platform);
+  if (!endpoints.authLoginUrl) {
+    renderErrorPage(
+      res,
+      500,
+      'This connection has no authorization endpoint',
+      `The registration for "${iss}" stores no authorization endpoint, and its configuration document could ` +
+        `not be read. Open Admin -> LTI connections and run Test to see what the LMS is serving.`,
+      'no_auth_endpoint',
+    );
+    return;
+  }
+
+  const authUrl = new URL(endpoints.authLoginUrl);
   authUrl.searchParams.set('scope', 'openid');
   authUrl.searchParams.set('response_type', 'id_token');
   authUrl.searchParams.set('response_mode', 'form_post');
@@ -131,7 +149,10 @@ async function handleLoginInitiation(req: Request, res: Response) {
   if (lti_message_hint) authUrl.searchParams.set('lti_message_hint', lti_message_hint);
   if (lti_deployment_id) authUrl.searchParams.set('lti_deployment_id', lti_deployment_id);
 
-  console.log(`[lti] login initiation from ${iss} -> redirecting to ${platform.auth_login_url}`);
+  console.log(
+    `[lti] login initiation from ${iss} -> redirecting to ${endpoints.authLoginUrl} ` +
+      `(${endpoints.source}${endpoints.stale ? ', stale' : ''})`,
+  );
   res.redirect(302, authUrl.toString());
 }
 

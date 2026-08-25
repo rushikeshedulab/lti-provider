@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api, formatTime } from '../lib/api';
+import { ApiError, api, formatTime } from '../lib/api';
 
 /**
  * PLATFORM CONNECTIONS
@@ -27,14 +27,23 @@ interface Deployment {
   contextTitle: string | null;
 }
 
+// NOTE: these interfaces are hand-copied from the server. Connection mirrors
+// connectionView() in src/routes/admin.routes.ts; Discovered and Diagnosis
+// mirror src/services/platformDiscovery.ts. There is no shared types package -
+// the frontend build imports nothing from src/ - so they must be moved together.
 interface Connection {
   id: number;
   name: string;
   issuer: string;
   clientId: string;
   authLoginUrl: string;
-  authTokenUrl: string;
+  authTokenUrl: string | null;
   jwksUrl: string;
+  /** The document these endpoints are re-read from. Null = entered by hand. */
+  discoveryUrl: string | null;
+  discoverySource: string | null;
+  discoveryFetchedAt: string | null;
+  discoveryError: string | null;
   toolRedirectUri: string;
   isActive: boolean;
   createdVia: string;
@@ -58,27 +67,52 @@ interface EndpointReport {
   url: string;
   ok: boolean;
   status: number | null;
+  contentType: string | null;
+  verdict: string;
   detail: string;
 }
 
-interface Diagnosis {
+interface EndpointFailure {
+  field: 'issuer' | 'authLoginUrl' | 'authTokenUrl' | 'jwksUrl';
+  code: string;
+  message: string;
+}
+
+interface Validation {
+  ok: boolean;
   jwks: { ok: boolean; keys: number; error?: string };
   authorization: EndpointReport;
-  token: EndpointReport;
+  token: EndpointReport | null;
+  failures: EndpointFailure[];
+  warnings: string[];
+}
+
+interface Diagnosis extends Validation {
   issuerMismatch: { saved: string; published: string } | null;
   notes: string[];
 }
 
+/** One address discovery tried, and what it actually served. */
+interface DiscoveryAttempt {
+  url: string;
+  reason: string;
+  detail: string;
+}
+
 interface Discovered {
   name: string | null;
-  issuer: string;
-  authLoginUrl: string;
-  authTokenUrl: string;
-  jwksUrl: string;
+  issuer: string | null;
+  discoveryUrl: string | null;
+  // Null when nothing could be confirmed. The form leaves the field empty rather
+  // than offering a path borrowed from a different LMS.
+  authLoginUrl: string | null;
+  authTokenUrl: string | null;
+  jwksUrl: string | null;
   source: string;
   suggestedClientId: string | null;
   suggestedDeploymentId: string | null;
   warning: string | null;
+  attempts: DiscoveryAttempt[];
 }
 
 const EMPTY_FORM = {
@@ -90,9 +124,23 @@ const EMPTY_FORM = {
   authLoginUrl: '',
   authTokenUrl: '',
   jwksUrl: '',
+  discoveryUrl: '',
   notes: '',
 };
 type FormState = typeof EMPTY_FORM;
+
+/** The endpoint half of the form. One declaration drives inputs and error slots. */
+const ENDPOINT_FIELDS: { key: keyof FormState; label: string; hint?: string }[] = [
+  { key: 'issuer', label: 'Issuer (iss)', hint: 'Must match the `iss` the LMS sends, character for character.' },
+  { key: 'authLoginUrl', label: 'Authorization endpoint' },
+  { key: 'authTokenUrl', label: 'Token endpoint', hint: 'Optional - only LTI Advantage service calls need it.' },
+  { key: 'jwksUrl', label: 'JWKS URL' },
+  {
+    key: 'discoveryUrl',
+    label: 'Discovery document URL',
+    hint: 'When set, the three endpoints above are re-read from this document automatically. Leave blank to keep them fixed.',
+  },
+];
 
 function CopyField({ label, value }: { label: string; value: string }) {
   const [copied, setCopied] = useState(false);
@@ -129,7 +177,9 @@ export default function Connections({ token }: { token: string }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [ignoreJwksCheck, setIgnoreJwksCheck] = useState(false);
+  // Which fields the server rejected, so the message sits under the offending
+  // input instead of in one flat banner at the top.
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<string, string>>>({});
   const [newDeployment, setNewDeployment] = useState<Record<number, string>>({});
   const [diagnosis, setDiagnosis] = useState<Record<number, Diagnosis>>({});
   const [editing, setEditing] = useState<Record<number, Partial<Connection>>>({});
@@ -162,24 +212,39 @@ export default function Connections({ token }: { token: string }) {
         '/api/admin/connections/discover',
         { method: 'POST', body: JSON.stringify({ url: form.url }) },
       );
-      setDiscovered(result.discovered);
+      const found = result.discovered;
+      setDiscovered(found);
+      setFieldErrors({});
+
+      // Nothing was published. The fields stay EMPTY on purpose: filling them
+      // with a plausible-looking guess is what produced a saved connection that
+      // launched into a path the LMS does not serve. The attempts table below
+      // shows what each address actually answered.
+      if (found.source === 'none') {
+        set({ issuer: '', authLoginUrl: '', authTokenUrl: '', jwksUrl: '', discoveryUrl: '' });
+        setShowAdvanced(true);
+        return;
+      }
+
       set({
-        issuer: result.discovered.issuer,
-        authLoginUrl: result.discovered.authLoginUrl,
-        authTokenUrl: result.discovered.authTokenUrl,
-        jwksUrl: result.discovered.jwksUrl,
-        name: form.name || result.discovered.name || '',
+        issuer: found.issuer ?? '',
+        authLoginUrl: found.authLoginUrl ?? '',
+        authTokenUrl: found.authTokenUrl ?? '',
+        jwksUrl: found.jwksUrl ?? '',
+        discoveryUrl: found.discoveryUrl ?? '',
+        name: form.name || found.name || '',
         // Only offered as a convenience when the LMS publishes them; the
         // administrator is still expected to paste the real values.
-        clientId: form.clientId || result.discovered.suggestedClientId || '',
-        deploymentId: form.deploymentId || result.discovered.suggestedDeploymentId || '',
+        clientId: form.clientId || found.suggestedClientId || '',
+        deploymentId: form.deploymentId || found.suggestedDeploymentId || '',
       });
       setNotice(
         result.jwks.ok
-          ? `Read ${result.discovered.source} and found ${result.jwks.keys} signing key(s).`
-          : `Endpoints filled in from ${result.discovered.source}, but the key set could not be read.`,
+          ? `Read ${found.source} and found ${result.jwks.keys} signing key(s).` +
+              (found.discoveryUrl ? ' These endpoints will be re-read from that document automatically.' : '')
+          : `Endpoints filled in from ${found.source}, but the key set could not be read.`,
       );
-      if (!result.jwks.ok || result.discovered.warning) setShowAdvanced(true);
+      if (!result.jwks.ok || found.warning) setShowAdvanced(true);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -187,24 +252,48 @@ export default function Connections({ token }: { token: string }) {
     }
   };
 
-  const save = async (event: React.FormEvent) => {
+  const save = async (event: React.FormEvent, saveSuspended = false) => {
     event.preventDefault();
     setError(null);
     setNotice(null);
+    setFieldErrors({});
     setSaving(true);
     try {
-      await authed<{ connection: Connection }>('/api/admin/connections', {
+      const result = await authed<{ connection: Connection; notice?: string }>('/api/admin/connections', {
         method: 'POST',
-        body: JSON.stringify({ ...form, ignoreJwksCheck }),
+        body: JSON.stringify({ ...form, saveSuspended }),
       });
       setForm(EMPTY_FORM);
       setDiscovered(null);
       setShowAdvanced(false);
-      setIgnoreJwksCheck(false);
-      setNotice('Connection saved. Launch it from the LMS to confirm it works end to end.');
+      setNotice(result.notice ?? 'Connection saved. Launch it from the LMS to confirm it works end to end.');
       await load();
     } catch (e) {
-      setError((e as Error).message);
+      const err = e as ApiError;
+      setError(err.message);
+      // The server says which endpoint is wrong and why; show it where the
+      // administrator can act on it.
+      const validation = err.body?.validation as Validation | undefined;
+      if (validation?.failures?.length) {
+        setFieldErrors(Object.fromEntries(validation.failures.map((f) => [f.field, f.message])));
+        setShowAdvanced(true);
+      }
+      if (err.code === 'discovery_failed') {
+        setDiscovered({
+          name: null,
+          issuer: null,
+          discoveryUrl: null,
+          authLoginUrl: null,
+          authTokenUrl: null,
+          jwksUrl: null,
+          source: 'none',
+          suggestedClientId: null,
+          suggestedDeploymentId: null,
+          warning: err.message,
+          attempts: (err.body?.attempts as DiscoveryAttempt[]) ?? [],
+        });
+        setShowAdvanced(true);
+      }
     } finally {
       setSaving(false);
     }
@@ -302,12 +391,49 @@ export default function Connections({ token }: { token: string }) {
               />
             </div>
 
-            {discovered && (
+            {discovered && discovered.source !== 'none' && (
               <div className={discovered.warning ? 'notice warn' : 'notice'} style={{ marginBottom: 12 }}>
                 {discovered.warning ?? (
                   <>
                     Endpoints read from <span className="mono">{discovered.source}</span>.
                   </>
+                )}
+              </div>
+            )}
+
+            {/*
+              Nothing was published. This panel is the difference between
+              "discovery failed" and an administrator who can actually fix it:
+              it names every address tried and what each one served, so a
+              front-end answering HTTP 200 text/html reads as the cause rather
+              than looking like a working endpoint.
+            */}
+            {discovered && discovered.source === 'none' && (
+              <div className="notice bad" style={{ marginBottom: 12 }}>
+                <strong>This LMS publishes no LTI configuration.</strong>
+                <p style={{ margin: '6px 0' }}>{discovered.warning}</p>
+                <p style={{ margin: '6px 0' }}>
+                  Ask the LMS administrator for its authorization endpoint, token endpoint and JWKS URL, and
+                  enter them under <em>Show endpoints</em>. They are normally on the LMS's own
+                  tool-registration screen.
+                </p>
+                {discovered.attempts.length > 0 && (
+                  <details style={{ marginTop: 8 }}>
+                    <summary className="small">
+                      What each address served ({discovered.attempts.length} tried)
+                    </summary>
+                    <ul className="small" style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+                      {discovered.attempts.map((attempt) => (
+                        <li key={attempt.url} style={{ marginBottom: 6 }}>
+                          <span className="mono">{attempt.url}</span>
+                          <br />
+                          <span className="muted">
+                            {attempt.reason} - {attempt.detail}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
                 )}
               </div>
             )}
@@ -319,60 +445,55 @@ export default function Connections({ token }: { token: string }) {
             {showAdvanced && (
               <div style={{ marginTop: 12 }}>
                 <p className="muted small">
-                  Discovered from the address above. Correct any of them if this LMS uses different paths.
+                  Read from the address above where the LMS publishes them. Correct any of them if this LMS
+                  uses different paths. Every one is checked against the LMS before the connection is saved.
                 </p>
-                <div className="field">
-                  <label htmlFor="issuer">Issuer (iss)</label>
-                  <input
-                    id="issuer"
-                    className="mono"
-                    value={form.issuer}
-                    onChange={(e) => set({ issuer: e.target.value })}
-                  />
-                </div>
-                <div className="field">
-                  <label htmlFor="authLoginUrl">Authorization endpoint</label>
-                  <input
-                    id="authLoginUrl"
-                    className="mono"
-                    value={form.authLoginUrl}
-                    onChange={(e) => set({ authLoginUrl: e.target.value })}
-                  />
-                </div>
-                <div className="field">
-                  <label htmlFor="authTokenUrl">Token endpoint</label>
-                  <input
-                    id="authTokenUrl"
-                    className="mono"
-                    value={form.authTokenUrl}
-                    onChange={(e) => set({ authTokenUrl: e.target.value })}
-                  />
-                </div>
-                <div className="field">
-                  <label htmlFor="jwksUrl">JWKS URL</label>
-                  <input
-                    id="jwksUrl"
-                    className="mono"
-                    value={form.jwksUrl}
-                    onChange={(e) => set({ jwksUrl: e.target.value })}
-                  />
-                </div>
-                <label className="row small" style={{ gap: 6, margin: '0 0 12px' }}>
-                  <input
-                    type="checkbox"
-                    checked={ignoreJwksCheck}
-                    onChange={(e) => setIgnoreJwksCheck(e.target.checked)}
-                    style={{ width: 'auto' }}
-                  />
-                  Save even if the key set cannot be read yet
-                </label>
+                {ENDPOINT_FIELDS.map(({ key, label, hint }) => (
+                  <div className="field" key={key}>
+                    <label htmlFor={key}>{label}</label>
+                    <input
+                      id={key}
+                      className="mono"
+                      value={form[key]}
+                      onChange={(e) => set({ [key]: e.target.value } as Partial<FormState>)}
+                      aria-invalid={Boolean(fieldErrors[key])}
+                      style={fieldErrors[key] ? { borderColor: '#c0392b' } : undefined}
+                    />
+                    {fieldErrors[key] ? (
+                      <p className="small" style={{ color: '#c0392b', margin: '4px 0 0' }}>
+                        {fieldErrors[key]}
+                      </p>
+                    ) : hint ? (
+                      <p className="muted small" style={{ margin: '4px 0 0' }}>
+                        {hint}
+                      </p>
+                    ) : null}
+                  </div>
+                ))}
               </div>
             )}
 
-            <div style={{ marginTop: 14 }}>
+            <div style={{ marginTop: 14 }} className="row">
               <button type="submit" disabled={saving || !form.clientId || !form.deploymentId}>
                 {saving ? 'Saving…' : 'Save connection'}
               </button>
+              {/*
+                The honest replacement for "save even if the key set cannot be
+                read", which used to store a connection that looked like it
+                worked and failed every launch. This one is stored suspended,
+                so it cannot serve a launch until somebody resumes it.
+              */}
+              {showAdvanced && !form.url && (
+                <button
+                  type="button"
+                  className="secondary small"
+                  disabled={saving || !form.clientId || !form.deploymentId}
+                  onClick={(e) => void save(e, true)}
+                  title="Stores the connection without verifying its endpoints. It stays suspended until you resume it."
+                >
+                  Save suspended (LMS not reachable yet)
+                </button>
+              )}
             </div>
           </form>
         </div>
@@ -485,6 +606,8 @@ export default function Connections({ token }: { token: string }) {
                     ['authLoginUrl', 'Authorization endpoint'],
                     ['authTokenUrl', 'Token endpoint'],
                     ['jwksUrl', 'JWKS URL'],
+                    // Blank it to stop re-reading and pin the three above.
+                    ['discoveryUrl', 'Discovery document URL (blank = endpoints stay fixed)'],
                   ] as const
                 ).map(([field, label]) => (
                   <div className="field" key={field}>
@@ -529,6 +652,33 @@ export default function Connections({ token }: { token: string }) {
                 <dd className="mono small">{connection.authTokenUrl}</dd>
                 <dt>JWKS</dt>
                 <dd className="mono small">{connection.jwksUrl}</dd>
+                {/*
+                  Where those three URLs came from, and how current they are.
+                  Without this the connection reads as static configuration even
+                  when it is being re-read from the LMS on a timer.
+                */}
+                <dt>Endpoints</dt>
+                <dd className="small">
+                  {connection.discoveryUrl ? (
+                    <>
+                      re-read from <span className="mono">{connection.discoverySource ?? 'discovery'}</span>,
+                      last {formatTime(connection.discoveryFetchedAt)}
+                      <br />
+                      <span className="muted mono">{connection.discoveryUrl}</span>
+                    </>
+                  ) : (
+                    <span className="muted">entered by hand - not re-read automatically</span>
+                  )}
+                  {connection.discoveryError && (
+                    <>
+                      <br />
+                      <span className="badge bad" title={connection.discoveryError}>
+                        stale
+                      </span>{' '}
+                      <span className="muted">{connection.discoveryError}</span>
+                    </>
+                  )}
+                </dd>
               </dl>
             )}
 
@@ -553,7 +703,10 @@ export default function Connections({ token }: { token: string }) {
                   <strong>Authorization endpoint</strong> {diagnosis[connection.id]!.authorization.detail}
                 </div>
                 <div style={{ marginBottom: 6 }}>
-                  <strong>Token endpoint</strong> {diagnosis[connection.id]!.token.detail}
+                  {/* Null when the platform publishes no token endpoint at all -
+                      legitimate, and not the same thing as a broken one. */}
+                  <strong>Token endpoint</strong>{' '}
+                  {diagnosis[connection.id]!.token?.detail ?? 'not published by this platform'}
                 </div>
                 {diagnosis[connection.id]!.notes.map((note) => (
                   <div className="small" key={note} style={{ marginTop: 4 }}>

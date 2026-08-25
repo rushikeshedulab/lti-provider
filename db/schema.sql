@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS lti_platforms (
   client_id           TEXT NOT NULL,
   deployment_ids      TEXT[] NOT NULL,
   auth_login_url      TEXT NOT NULL,
-  auth_token_url      TEXT NOT NULL,
+  auth_token_url      TEXT,
   jwks_url            TEXT NOT NULL,
   tool_redirect_uri   TEXT NOT NULL,
   is_active           BOOLEAN NOT NULL DEFAULT TRUE,
@@ -104,6 +104,21 @@ CREATE TABLE IF NOT EXISTS lti_platforms (
   -- launch is ever refused on account of it.
   activated_deployments JSONB NOT NULL DEFAULT '{}'::jsonb,
 
+  -- DYNAMIC ENDPOINT RESOLUTION
+  -- auth_login_url / auth_token_url / jwks_url above are NOT the administrator's
+  -- typed values frozen forever. They are the last values that VALIDATED: when
+  -- discovery_url is set, a background refresh re-reads that document and
+  -- rewrites them, so an LMS that moves an endpoint is followed without anyone
+  -- editing a connection. discovery_url IS NULL means the endpoints were entered
+  -- by hand and are authoritative as they stand.
+  --   discovery_source      which document answered ('openid-configuration', ...)
+  --   discovery_fetched_at  when it was last read successfully
+  --   discovery_error       why the last read failed, or an issuer mismatch note
+  discovery_url         TEXT,
+  discovery_source      TEXT,
+  discovery_fetched_at  TIMESTAMPTZ,
+  discovery_error       TEXT,
+
   UNIQUE (issuer, client_id)
 );
 
@@ -114,6 +129,12 @@ ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS status      TEXT NOT NULL DEF
 ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS notes       TEXT;
 ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS updated_at  TIMESTAMPTZ NOT NULL DEFAULT now();
 ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS activated_deployments JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS discovery_url        TEXT;
+ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS discovery_source     TEXT;
+ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS discovery_fetched_at TIMESTAMPTZ;
+ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS discovery_error      TEXT;
+-- A platform may publish no token endpoint; NULL says so honestly.
+ALTER TABLE lti_platforms ALTER COLUMN auth_token_url DROP NOT NULL;
 
 -- ---------------------------------------------------------------------------
 -- OIDC STATE + NONCE STORES

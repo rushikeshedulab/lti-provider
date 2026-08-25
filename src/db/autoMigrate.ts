@@ -34,6 +34,35 @@ const STATEMENTS: { label: string; sql: string }[] = [
     sql: `ALTER TABLE lti_platforms
             ADD COLUMN IF NOT EXISTS activated_deployments JSONB NOT NULL DEFAULT '{}'::jsonb`,
   },
+  // DYNAMIC ENDPOINT RESOLUTION
+  // A connection now remembers WHERE its endpoints came from, so they can be
+  // re-read from the platform instead of being frozen at the moment of saving.
+  // The three existing *_url columns become the last-known-good snapshot.
+  {
+    label: 'lti_platforms.discovery_url',
+    sql: `ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS discovery_url TEXT`,
+  },
+  {
+    label: 'lti_platforms.discovery_source',
+    sql: `ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS discovery_source TEXT`,
+  },
+  {
+    label: 'lti_platforms.discovery_fetched_at',
+    sql: `ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS discovery_fetched_at TIMESTAMPTZ`,
+  },
+  {
+    label: 'lti_platforms.discovery_error',
+    sql: `ALTER TABLE lti_platforms ADD COLUMN IF NOT EXISTS discovery_error TEXT`,
+  },
+  {
+    /**
+     * A platform may publish no token endpoint at all - only LTI Advantage
+     * service calls need one - and storing '' for "absent" would pass some
+     * emptiness checks and fail others. NULL is the honest value.
+     */
+    label: 'lti_platforms.auth_token_url: allow NULL',
+    sql: `ALTER TABLE lti_platforms ALTER COLUMN auth_token_url DROP NOT NULL`,
+  },
   {
     /**
      * `status` is only ever a summary of `activated_deployments`, so recompute

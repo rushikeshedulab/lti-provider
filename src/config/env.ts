@@ -42,6 +42,13 @@ export const env = {
   viewHeartbeatTimeoutSeconds: num('VIEW_HEARTBEAT_TIMEOUT_SECONDS', 90),
   viewReaperIntervalSeconds: num('VIEW_REAPER_INTERVAL_SECONDS', 30),
 
+  /**
+   * How long a connection's endpoints are trusted before its discovery document
+   * is re-read. Endpoint paths change on the order of deploys, not minutes, and
+   * a refresh never blocks a launch - see services/platformEndpoints.ts.
+   */
+  platformDiscoveryTtlSeconds: num('PLATFORM_DISCOVERY_TTL_SECONDS', 900),
+
   stateTtlSeconds: num('LTI_STATE_TTL_SECONDS', 600),
   nonceTtlSeconds: num('LTI_NONCE_TTL_SECONDS', 600),
   maxTokenAgeSeconds: num('LTI_MAX_TOKEN_AGE_SECONDS', 300),

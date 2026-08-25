@@ -17,7 +17,8 @@
     "frontend:dev": "npm --prefix frontend run dev",
     "build": "tsc -p tsconfig.json && npm run frontend:build",
     "dev": "tsx watch src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "check:discovery": "tsx scripts/check-discovery.ts"
   },
   "dependencies": {
     "cookie-parser": "^1.4.7",

@@ -19,7 +19,10 @@ import {
   discoverPlatform,
   DiscoveryError,
   probeJwks,
+  validateEndpoints,
 } from '../services/platformDiscovery.js';
+import { invalidatePlatformEndpoints, resolvePlatformEndpoints } from '../services/platformEndpoints.js';
+import { fetchJsonDocument } from '../services/httpProbe.js';
 import { toolRegistrationDocument } from '../config/registration.js';
 import { getLaunch } from '../services/launchStore.js';
 import { adminContentRouter } from './adminContent.routes.js';
@@ -209,6 +212,12 @@ function connectionView(platform: PlatformRegistration) {
     authTokenUrl: platform.auth_token_url,
     jwksUrl: platform.jwks_url,
     toolRedirectUri: platform.tool_redirect_uri,
+    // Where these endpoints came from and how current they are. Without this the
+    // resolver is invisible and a connection looks static even when it is not.
+    discoveryUrl: platform.discovery_url,
+    discoverySource: platform.discovery_source,
+    discoveryFetchedAt: platform.discovery_fetched_at,
+    discoveryError: platform.discovery_error,
     isActive: platform.is_active,
     createdVia: platform.created_via,
     status: platform.status,
@@ -247,7 +256,12 @@ adminRouter.post('/connections/discover', async (req, res) => {
   const url = String(req.body?.url ?? '').trim();
   try {
     const discovered = await discoverPlatform(url);
-    const jwks = await probeJwks(discovered.jwksUrl);
+    // Nothing was found, so there is no key set to probe. Saying so is the whole
+    // point: the form leaves its endpoint fields empty rather than filling them
+    // with a layout borrowed from some other LMS.
+    const jwks = discovered.jwksUrl
+      ? await probeJwks(discovered.jwksUrl)
+      : { ok: false, keys: 0, error: 'No JWKS URL was discovered.' };
     res.json({ discovered, jwks });
   } catch (err) {
     if (err instanceof DiscoveryError) {
@@ -281,15 +295,24 @@ adminRouter.post('/connections', async (req, res) => {
   // arrives with only `azp` set could not be resolved to a registration.
   const clash = await findPlatformByClientId(clientId);
 
-  let issuer = String(body.issuer ?? '').trim();
-  let authLoginUrl = String(body.authLoginUrl ?? '').trim();
-  let authTokenUrl = String(body.authTokenUrl ?? '').trim();
-  let jwksUrl = String(body.jwksUrl ?? '').trim();
-  let name = String(body.name ?? '').trim();
+  const trimmed = (value: unknown) => String(value ?? '').trim();
+  let issuer = trimmed(body.issuer);
+  let authLoginUrl = trimmed(body.authLoginUrl);
+  let authTokenUrl = trimmed(body.authTokenUrl);
+  let jwksUrl = trimmed(body.jwksUrl);
+  let discoveryUrl = trimmed(body.discoveryUrl);
+  let name = trimmed(body.name);
   let discoverySource: string | null = null;
   let discoveryWarning: string | null = null;
+  let discoveryAttempts: unknown[] = [];
 
-  const needsDiscovery = !issuer || !authLoginUrl || !authTokenUrl || !jwksUrl;
+  // `authTokenUrl` is deliberately not part of this test: a platform may publish
+  // no token endpoint at all (only LTI Advantage service calls need one), and
+  // demanding it would send us discovering over a connection already fully
+  // specified by hand.
+  const needsDiscovery = !issuer || !authLoginUrl || !jwksUrl;
+  const typedByHand = !needsDiscovery && !url;
+
   if (needsDiscovery) {
     if (!url) {
       res.status(400).json({
@@ -300,13 +323,30 @@ adminRouter.post('/connections', async (req, res) => {
     }
     try {
       const discovered = await discoverPlatform(url);
-      issuer ||= discovered.issuer;
-      authLoginUrl ||= discovered.authLoginUrl;
-      authTokenUrl ||= discovered.authTokenUrl;
-      jwksUrl ||= discovered.jwksUrl;
-      name ||= discovered.name ?? new URL(discovered.issuer).host;
+
+      // Nothing usable is published - and this is exactly where a guess used to
+      // be substituted. A guessed endpoint answers HTTP 200 on any LMS whose
+      // front-end serves index.html for unknown paths, so it passed every check
+      // and failed much later, as a launch redirecting into a path that does not
+      // exist. Refusing here, with the evidence, is the fix.
+      if (discovered.source === 'none') {
+        res.status(400).json({
+          error: 'discovery_failed',
+          message: discovered.warning,
+          attempts: discovered.attempts,
+        });
+        return;
+      }
+
+      issuer ||= discovered.issuer ?? '';
+      authLoginUrl ||= discovered.authLoginUrl ?? '';
+      authTokenUrl ||= discovered.authTokenUrl ?? '';
+      jwksUrl ||= discovered.jwksUrl ?? '';
+      discoveryUrl ||= discovered.discoveryUrl ?? '';
+      name ||= discovered.name ?? (discovered.issuer ? new URL(discovered.issuer).host : url);
       discoverySource = discovered.source;
       discoveryWarning = discovered.warning;
+      discoveryAttempts = discovered.attempts;
     } catch (err) {
       if (err instanceof DiscoveryError) {
         res.status(400).json({ error: err.code, message: err.message });
@@ -324,14 +364,31 @@ adminRouter.post('/connections', async (req, res) => {
     return;
   }
 
-  // Fail here rather than at the first launch: a registration whose key set
-  // cannot be read would accept the ids and then reject every launch with an
-  // opaque signature error.
-  const jwks = await probeJwks(jwksUrl);
-  if (!jwks.ok && body.ignoreJwksCheck !== true) {
+  // Fail here rather than at the first launch. A registration whose key set
+  // cannot be read accepts the ids and then rejects every launch with an opaque
+  // signature error; one whose authorization endpoint is really the LMS's
+  // front-end redirects the browser to a page that is not an LTI endpoint at all.
+  const validation = await validateEndpoints({
+    issuer,
+    authLoginUrl,
+    authTokenUrl: authTokenUrl || null,
+    jwksUrl,
+  });
+
+  // What used to be here was `ignoreJwksCheck`, and it was the ONLY route by
+  // which unverifiable endpoints ever reached the database - with its own error
+  // message advertising it. `saveSuspended` is the honest version of the same
+  // need ("the LMS is not deployed yet"): the connection is stored and stays
+  // suspended, instead of being stored and looking like it works.
+  const saveSuspended = body.saveSuspended === true && typedByHand;
+  if (!validation.ok && !saveSuspended) {
     res.status(400).json({
-      error: 'jwks_unreachable',
-      message: `${jwks.error} Check the LMS address, or save again with "ignore key check" if it is not reachable yet.`,
+      error: 'endpoints_unvalidated',
+      message: validation.failures.map((f) => f.message).join(' '),
+      validation,
+      ...(typedByHand
+        ? { hint: 'If the LMS is not reachable yet, save it suspended and resume the connection later.' }
+        : {}),
     });
     return;
   }
@@ -342,22 +399,31 @@ adminRouter.post('/connections', async (req, res) => {
     clientId,
     deploymentIds: [deploymentId],
     authLoginUrl,
-    authTokenUrl,
+    authTokenUrl: authTokenUrl || null,
     jwksUrl,
     toolRedirectUri: toolEndpoints.redirectUri,
     createdVia: 'admin',
     notes: body.notes ? String(body.notes) : null,
+    discoveryUrl: discoveryUrl || null,
+    discoverySource,
+    isActive: !saveSuspended,
   });
+  invalidatePlatformEndpoints(platform.id);
 
   console.log(
     `[admin] connection saved: ${platform.issuer} client_id=${platform.client_id} ` +
-      `deployment_ids=${platform.deployment_ids.join(',')}`,
+      `deployment_ids=${platform.deployment_ids.join(',')}` +
+      `${discoveryUrl ? ` discovery=${discoveryUrl}` : ''}${saveSuspended ? ' (suspended)' : ''}`,
   );
 
   res.status(201).json({
     connection: connectionView(platform),
-    discovery: { source: discoverySource, warning: discoveryWarning },
-    jwks,
+    discovery: { source: discoverySource, warning: discoveryWarning, attempts: discoveryAttempts },
+    validation,
+    jwks: validation.jwks,
+    ...(saveSuspended
+      ? { notice: 'Saved, but suspended: its endpoints could not be verified. Resume it once the LMS is reachable.' }
+      : {}),
   });
 });
 
@@ -435,13 +501,19 @@ adminRouter.post('/connections/:id/test', async (req, res) => {
     res.status(404).json({ error: 'unknown_connection' });
     return;
   }
+  // Force a re-read first, so the test reports on the endpoints a launch would
+  // actually use rather than on whatever was cached. This is the one caller
+  // allowed to wait for the network: a human asked for it.
+  const resolved = await resolvePlatformEndpoints(platform, { force: true });
+
   const diagnosis = await diagnoseConnection({
     issuer: platform.issuer,
-    authLoginUrl: platform.auth_login_url,
-    authTokenUrl: platform.auth_token_url,
-    jwksUrl: platform.jwks_url,
+    authLoginUrl: resolved.authLoginUrl,
+    authTokenUrl: resolved.authTokenUrl,
+    jwksUrl: resolved.jwksUrl,
+    discoveryUrl: platform.discovery_url,
   });
-  res.json({ diagnosis, jwks: diagnosis.jwks });
+  res.json({ diagnosis, jwks: diagnosis.jwks, resolved });
 });
 
 /** Corrects the endpoints of an existing connection without recreating it. */
@@ -452,28 +524,71 @@ adminRouter.patch('/connections/:id/endpoints', async (req, res) => {
     return;
   }
   const body = req.body ?? {};
+  // Merge over what is stored, then validate the WHOLE set. A body naming only
+  // one field still has to stand up alongside the three siblings it is keeping -
+  // otherwise correcting the JWKS URL silently blesses a stale authorization URL.
   const next = {
     name: String(body.name ?? platform.name).trim() || platform.name,
     issuer: String(body.issuer ?? platform.issuer).trim(),
     clientId: platform.client_id,
     deploymentIds: platform.deployment_ids,
     authLoginUrl: String(body.authLoginUrl ?? platform.auth_login_url).trim(),
-    authTokenUrl: String(body.authTokenUrl ?? platform.auth_token_url).trim(),
+    authTokenUrl: String(body.authTokenUrl ?? platform.auth_token_url ?? '').trim() || null,
     jwksUrl: String(body.jwksUrl ?? platform.jwks_url).trim(),
     toolRedirectUri: toolEndpoints.redirectUri,
     createdVia: platform.created_via,
     notes: platform.notes,
+    // Clearing this to empty means "these are hand-typed, stop re-reading them".
+    discoveryUrl: String(body.discoveryUrl ?? platform.discovery_url ?? '').trim() || null,
+    discoverySource: platform.discovery_source,
+    isActive: platform.is_active,
   };
+
+  // A discovery URL that does not resolve to a document would silently disable
+  // refreshing while looking enabled, so it is checked before it is stored.
+  if (next.discoveryUrl && next.discoveryUrl !== platform.discovery_url) {
+    const doc = await fetchJsonDocument(next.discoveryUrl);
+    if (!doc.ok) {
+      res.status(400).json({ error: 'discovery_url_invalid', message: doc.detail });
+      return;
+    }
+  }
+
+  const validation = await validateEndpoints(next);
+  if (!validation.ok) {
+    res.status(400).json({
+      error: 'endpoints_unvalidated',
+      message: validation.failures.map((f) => f.message).join(' '),
+      validation,
+    });
+    return;
+  }
 
   // The issuer is part of the row's identity, so changing it cannot be an
   // upsert - it would leave the old row behind and match neither.
   if (next.issuer !== platform.issuer) {
-    await query(`UPDATE lti_platforms SET issuer = $2, updated_at = now() WHERE id = $1`, [platform.id, next.issuer]);
+    try {
+      await query(`UPDATE lti_platforms SET issuer = $2, updated_at = now() WHERE id = $1`, [platform.id, next.issuer]);
+    } catch (err) {
+      // (issuer, client_id) is unique, so moving this row onto an issuer that
+      // already has a registration for the same client_id is a conflict, not a
+      // server error.
+      if ((err as { code?: string }).code === '23505') {
+        res.status(409).json({
+          error: 'issuer_in_use',
+          message: `A connection for issuer "${next.issuer}" with client_id "${platform.client_id}" already exists.`,
+        });
+        return;
+      }
+      throw err;
+    }
   }
   const updated = await upsertPlatform(next);
+  // Otherwise the correction is ignored until the cached entry expires.
+  invalidatePlatformEndpoints(updated.id);
 
   console.log(`[admin] connection ${updated.id} endpoints updated (issuer=${updated.issuer})`);
-  res.json({ connection: connectionView(updated) });
+  res.json({ connection: connectionView(updated), validation });
 });
 
 adminRouter.delete('/connections/:id', async (req, res) => {
