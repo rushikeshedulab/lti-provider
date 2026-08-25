@@ -277,12 +277,64 @@ ltiRouter.post('/launch', async (req: Request, res: Response) => {
   const lecture = lectureId ? await getLecture(lectureId) : null;
 
   if (!lecture) {
+    /**
+     * Two very different failures land here, and telling them apart is the
+     * whole point of this branch.
+     *
+     * No `lecture_id` custom claim at all means the platform launched the tool
+     * itself rather than a piece of its content - there is nothing this tool
+     * could have opened, and the fix is on the platform side (embed something
+     * via Deep Linking first). A `lecture_id` that simply does not resolve is a
+     * stale link: the content existed when it was embedded and has since been
+     * removed here.
+     */
+    const boundToNothing = !custom.lecture_id;
+    const instructor = isInstructorOrAdmin(claims);
+
+    await logActivity({
+      eventType: ACTIVITY_EVENT.LAUNCH_REJECTED,
+      userId: claims.sub,
+      userEmail: claims.email ?? null,
+      userName: claims.name ?? null,
+      platformIssuer: platform.issuer,
+      platformClientId: platform.client_id,
+      platformName: toolPlatform?.name ?? platform.name,
+      deploymentId,
+      ipAddress: ip,
+      userAgent,
+      metadata: {
+        code: boundToNothing ? 'no_resource_selected' : 'unknown_lecture',
+        resource_link_id: resourceLink?.id ?? null,
+        lecture_id: custom.lecture_id ?? null,
+        roles,
+      },
+    }).catch((err: Error) => console.warn(`[lti] could not log rejected launch: ${err.message}`));
+
+    if (boundToNothing) {
+      console.warn(
+        `[lti] resource-link launch from ${platform.issuer} carried no lecture_id ` +
+          `(resource_link_id="${resourceLink?.id ?? '(none)'}")`,
+      );
+      return renderErrorPage(
+        res,
+        404,
+        'This link is not pointing at any content',
+        instructor
+          ? 'The launch itself was valid, but it carried no "lecture_id" custom parameter, so there is nothing ' +
+              'here to open. A plain tool launch does not select content: go back to the LMS and use Deep Linking ' +
+              '("Browse & Embed") to pick a lecture, then launch the link that creates.'
+          : 'The launch itself was valid, but this link does not point at a lecture yet. Ask your instructor to ' +
+              'add content from this tool to the course.',
+        'no_resource_selected',
+      );
+    }
+
     return renderErrorPage(
       res,
       404,
       'Content not found',
-      `The launch was valid, but this tool has no lecture with id "${lectureId || '(none supplied)'}". ` +
-        `Expected a custom claim "lecture_id".`,
+      `The launch was valid, but this tool has no lecture with id "${lectureId}". The link was probably embedded ` +
+        `before that lecture was removed - re-pick it in the LMS via Deep Linking.`,
       'unknown_lecture',
     );
   }
